@@ -21,7 +21,7 @@ function create_fs () {
     local has_wipefs="" wipefs_command="" wipefs_info_message=""
     if has_binary wipefs ; then
         has_wipefs="yes"
-        wipefs_command="wipefs -a $device"
+        wipefs_command="wipefs -a -f $device"
         wipefs_info_message="Using wipefs to cleanup '$device' before creating filesystem."
         Debug "$wipefs_info_message"
         echo "# $wipefs_info_message" >> "$LAYOUT_CODE"
