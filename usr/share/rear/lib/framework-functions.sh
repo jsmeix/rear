@@ -10,17 +10,55 @@
 # source a file given in $1
 function Source () {
     local source_file="$1"
-    # Skip if source file name is empty:
+    # An optional error_behaviour="$2" specifies what to do in case of errors, see https://github.com/rear/rear/issues/741
+    # Currently the following values for error_behaviour are supported:
+    # skip_if_missing : skip sourcing source_file and return successfully if source_file is missing, not found, a directory, or empty
+    # exit_if_missing : bail out with BugError if source_file is missing, not found, a directory, or empty
+    # If error_behaviour is not specified the default (fully backward compatible) behaviour is:
+    # skip sourcing source_file and return successfully if source_file is missing, not found, or empty
+    # bail out with Error if source_file is a directory
+    local error_behaviour="$2"
+    # Test if source file name is empty:
     if test -z "$source_file" ; then
-        Debug "Skipping Source() because it was called with empty source file name"
-        return
+        case "$error_behaviour" in
+            (exit_if_missing)
+                BugError "Source() was called with empty source file name"
+                ;;
+            (*)
+                Debug "Skipping Source() because it was called with empty source file name"
+                return
+                ;;
+        esac
     fi
-    # Ensure source file is not a directory:
-    test -d "$source_file" && Error "Source file '$source_file' is a directory, cannot source"
-    # Skip if source file does not exist of if its content is empty:
+    # Use "$SHARE_DIR/$source_file" if "$source_file" is not an absolute path (i.e. when it has no leading '/')
+    # see https://github.com/rear/rear/pull/738 and https://github.com/rear/rear/issues/741
+    [[ "$source_file" == /* ]] || source_file="$SHARE_DIR/$source_file"
+    # Test if source file is a directory:
+    if test -d "$source_file" ; then
+        case "$error_behaviour" in
+            (skip_if_missing)
+                Debug "Skipping Source() because source file '$source_file' is a directory"
+                return
+                ;;
+            (exit_if_missing)
+                BugError "Source() was called with source file '$source_file' that is a directory"
+                ;;
+            (*)
+                Error "Source file '$source_file' is a directory, cannot source"
+                ;;
+        esac
+    fi
+    # Test if source file does not exist of if its content is empty:
     if ! test -s "$source_file" ; then
-        Debug "Skipping Source() because source file '$source_file' not found or empty"
-        return
+        case "$error_behaviour" in
+            (exit_if_missing)
+                BugError "Source() was called with source file '$source_file' not found or empty"
+                ;;
+            (*)
+                Debug "Skipping Source() because source file '$source_file' not found or empty"
+                return
+                ;;
+        esac
     fi
     # Clip leading standard path to rear files (usually /usr/share/rear/):
     local relname="${source_file##$SHARE_DIR/}"

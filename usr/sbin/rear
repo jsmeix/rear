@@ -352,18 +352,18 @@ fi
 # Combine configuration files:
 Debug "Combining configuration files"
 # Use this file to manually override the OS detection:
-test -r "$CONFIG_DIR/os.conf" && Source "$CONFIG_DIR/os.conf" || true
-test -r "$CONFIG_DIR/$WORKFLOW.conf" && Source "$CONFIG_DIR/$WORKFLOW.conf" || true
+Source "$CONFIG_DIR/os.conf" "skip_if_missing"
+Source "$CONFIG_DIR/$WORKFLOW.conf" "skip_if_missing"
 SetOSVendorAndVersion
 # Distribution configuration files:
 for config in "$ARCH" "$OS" \
         "$OS_MASTER_VENDOR" "$OS_MASTER_VENDOR_ARCH" "$OS_MASTER_VENDOR_VERSION" "$OS_MASTER_VENDOR_VERSION_ARCH" \
         "$OS_VENDOR" "$OS_VENDOR_ARCH" "$OS_VENDOR_VERSION" "$OS_VENDOR_VERSION_ARCH" ; do
-    test -r "$SHARE_DIR/conf/$config.conf" && Source "$SHARE_DIR/conf/$config.conf" || true
+    Source "$SHARE_DIR/conf/$config.conf" "skip_if_missing"
 done
 # User configuration files, last thing is to overwrite variables if we are in the rescue system:
 for config in site local rescue ; do
-    test -r "$CONFIG_DIR/$config.conf" && Source "$CONFIG_DIR/$config.conf" || true
+    Source "$CONFIG_DIR/$config.conf" "skip_if_missing"
 done
 # Now SHARE_DIR CONFIG_DIR VAR_DIR LOG_DIR and KERNEL_VERSION should be set to a fixed value:
 readonly SHARE_DIR CONFIG_DIR VAR_DIR LOG_DIR KERNEL_VERSION
