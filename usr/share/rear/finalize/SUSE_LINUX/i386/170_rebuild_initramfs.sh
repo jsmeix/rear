@@ -2,15 +2,23 @@
 # Rebuild the initrd if the drivers changed:
 
 # Skip if there is nothing to do.
-# During "rear recover" 260_recovery_storage_drivers.sh creates $TMP_DIR/storage_drivers
-if ! test -s $TMP_DIR/storage_drivers ; then
-    Log "Skip recreating initrd: No needed storage drivers ('$TMP_DIR/storage_drivers' is empty)"
+# If REBUILD_INITRAMFS has a 'false' value, the initrd/initramfs must not be recreated.
+if is_false "$REBUILD_INITRAMFS" ; then
+    LogPrint "No driver migration because REBUILD_INITRAMFS is 'false'"
     return 0
 fi
-# During "rear mkbackup/mkrescue" 260_storage_drivers.sh creates $VAR_DIR/recovery/storage_drivers
-if cmp -s $TMP_DIR/storage_drivers $VAR_DIR/recovery/storage_drivers ; then
-    Log "Skip recreating initrd: '$TMP_DIR/storage_drivers' and '$VAR_DIR/recovery/storage_drivers' are the same"
-    return 0
+# If REBUILD_INITRAMFS has a 'true' value, the initrd/initramfs must be recreated.
+if ! is_true "$REBUILD_INITRAMFS" ; then
+    # During "rear recover" 260_recovery_storage_drivers.sh creates $TMP_DIR/storage_drivers
+    if ! test -s $TMP_DIR/storage_drivers ; then
+        Log "Skip recreating initrd: No needed storage drivers ('$TMP_DIR/storage_drivers' is empty)"
+        return 0
+    fi
+    # During "rear mkbackup/mkrescue" 260_storage_drivers.sh creates $VAR_DIR/recovery/storage_drivers
+    if cmp -s $TMP_DIR/storage_drivers $VAR_DIR/recovery/storage_drivers ; then
+        Log "Skip recreating initrd: '$TMP_DIR/storage_drivers' and '$VAR_DIR/recovery/storage_drivers' are the same"
+        return 0
+    fi
 fi
 
 # A longer time ago udev was optional on some distros.
@@ -19,6 +27,9 @@ fi
 # But it is not necessarily an error if initrd cannot be re-created here
 # because usually it works with the unchanged initrd from the backup restore.
 if ! have_udev ; then
+    # If REBUILD_INITRAMFS has a 'true' value, the initrd/initramfs must be recreated.
+    is_true "$REBUILD_INITRAMFS" && Error "Cannot recreate initrd (no udev found)."
+    # If REBUILD_INITRAMFS has not a 'true' value, the initrd/initramfs may or may not be recreated.
     LogPrint "WARNING:
 Cannot recreate initrd (no udev found).
 It may work with the initrd 'as is' from the backup restore.
@@ -83,6 +94,10 @@ local mkinitrd_binary=$( chroot $TARGET_FS_ROOT /bin/bash -c 'PATH=/sbin:/usr/sb
 if test $mkinitrd_binary ; then
     if chroot $TARGET_FS_ROOT $mkinitrd_binary >&2 ; then
         LogPrint "Recreated initrd ($mkinitrd_binary)."
+        # When the initrd/initramfs is successfully recreated,
+        # REBUILD_INITRAMFS must be no longer a 'true' value
+        # because that would mean the initrd/initramfs still must be recreated:
+        REBUILD_INITRAMFS=""
     else
         LogPrint "WARNING:
 Failed to create initrd ($mkinitrd_binary).
