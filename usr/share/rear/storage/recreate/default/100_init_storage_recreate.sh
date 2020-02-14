@@ -28,7 +28,7 @@ function wait_for_device_node () {
     local device_node=$1
     test "$device_node" || BugError "wait_for_device_node() called without device_node argument"
     local timeout=$2
-    is_positive_integer $timeout || timeout=10
+    is_positive_integer $timeout 1>/dev/null || timeout=10
     local countdown
     for countdown in $( seq $timeout -1 0 ) ; do
         test -b $device_node && return 0
@@ -46,7 +46,8 @@ function wait_for_device_node () {
 # For all 'disk' type kernel device names in STORAGE_LSBLK_OUTPUT_FILE
 # create partitions according to the 'parted' output in STORAGE_PARTED_OUTPUT_FILE:
 local disk_kname partition_number partition_parted_line missing_partition
-local partition_start_byte partition_start_number partition_end_byte partition_end_number partition_filesystem_type gpt_partition_name partition_flags
+local partition_start_byte partition_start_number partition_end_byte partition_end_number partition_filesystem_type gpt_partition_name
+local partition_flags partition_flag
 for disk_kname in $( grep 'TYPE="disk"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' KNAME="[^"]*"' | cut -d '"' -f2 ) ; do
     Log "Creating partitions on $disk_kname according to $STORAGE_PARTED_OUTPUT_FILE"
     if ! grep -q "^$disk_kname " $STORAGE_PARTED_OUTPUT_FILE ; then
@@ -91,13 +92,13 @@ for disk_kname in $( grep 'TYPE="disk"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' K
         #   disk_kname "number":"begin":"end":"size":"filesystem-type":"partition-name":"flags-set";
         partition_start_byte=$( cut -d ':' -f2 <<<"$partition_parted_line" )
         partition_start_number=${partition_start_byte%%[^0-9]*}
-        if ! is_positive_integer $partition_start_number ; then
+        if ! is_positive_integer $partition_start_number 1>/dev/null ; then
             LogPrintError "Cannot create partition $partition_number on $disk_kname (partition start $partition_start_number no positive integer)"
             continue
         fi
         partition_end_byte=$( cut -d ':' -f3 <<<"$partition_parted_line" )
         partition_end_number=${partition_end_byte%%[^0-9]*}
-        if ! is_positive_integer $partition_end_number ; then 
+        if ! is_positive_integer $partition_end_number 1>/dev/null ; then 
             LogPrintError "Cannot create partition $partition_number on $disk_kname (partition end $partition_end_number no positive integer)"
             continue
         fi
@@ -106,14 +107,42 @@ for disk_kname in $( grep 'TYPE="disk"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' K
             continue
         fi
         partition_filesystem_type=$( cut -d ':' -f5 <<<"$partition_parted_line" )
+        # The GNU Parted User Manual section about parted's 'mkpart' command
+        # at https://www.gnu.org/software/parted/manual/parted.html#mkpart
+        # reads "fs-type is required for data partitions (i.e., non-extended partitions)"
+        # so we have to set a fallback value when $partition_filesystem_type is empty:
         test "$partition_filesystem_type" || partition_filesystem_type="ext2"
         gpt_partition_name=$( cut -d ':' -f6 <<<"$partition_parted_line" )
-        test "gpt_partition_name" || gpt_partition_name="$( basename $disk_kname )$partition_number"
-        partition_flags=$( cut -d ':' -f7 <<<"$partition_parted_line" )
-        if ! parted -s $disk_kname mkpart "$gpt_partition_name" $partition_start_byte $partition_end_byte ; then
-            LogPrintError "Failed to create partition $partition_number on $disk_kname ('parted -s $disk_kname mkpart '$gpt_partition_name' $partition_start_byte $partition_end_byte' failed)"
+        # The GNU Parted User Manual section about parted's 'mkpart' command
+        # at https://www.gnu.org/software/parted/manual/parted.html#mkpart
+        # reads "A name must be specified for a ‘gpt’ partition table"
+        # so we have to set a fallback value when $gpt_partition_name is empty:
+        test "$gpt_partition_name" || gpt_partition_name="$( basename $disk_kname )$partition_number"
+        if ! parted -s $disk_kname mkpart "$gpt_partition_name" "$partition_filesystem_type" $partition_start_byte $partition_end_byte ; then
+            LogPrintError "Failed to create partition $partition_number on $disk_kname ('parted -s $disk_kname mkpart '$gpt_partition_name''$partition_filesystem_type' $partition_start_byte $partition_end_byte' failed)"
             continue
         fi
+        # For example the flags-set entry in the 'parted -m' output line is
+        #   raid, legacy_boot;
+        # (cf. the 'parted -m' output line example above).
+        # According to the GNU Parted User Manual section about parted's 'set' command
+        # at https://www.gnu.org/software/parted/manual/parted.html#set
+        # the possible flags only for GPT partitions are
+        #   bios_grub legacy_boot msftdata
+        # and only for legacy MS-DOS partitions
+        #   boot lba hidden raid LVM PALO DIAG
+        # and for both GPT and MS-DOS partitions
+        #   msftres irst esp PREP
+        # so all flags consist of a single word (i.e. no blank characters in a flag name)
+        # so that we can translate e.g. "raid, legacy_boot;" into "raid legacy_boot":
+        partition_flags=$( cut -d ':' -f7 <<<"$partition_parted_line" | tr -d ',;' )
+        # When $partition_flags is empty the 'for' loop does nothing:
+        for partition_flag in $partition_flags ; do
+            if ! parted -s $disk_kname set $partition_number $partition_flag on ; then
+                LogPrintError "Failed to set partition flag $partition_flag on partition $partition_number on $disk_kname ('parted -s $disk_kname set $partition_number $partition_flag on' failed)"
+                continue
+            fi
+        done
 
     done
 
