@@ -8,18 +8,23 @@ Debug "Creating directories where to storage info gets saved (when not existing)
 readonly STORAGE_SAVED_DIR="$VAR_DIR/storage/saved"
 mkdir -p $v "$STORAGE_SAVED_DIR"
 
-# We need directory for XFS options only if XFS is in use:
-if test "$( mount -t xfs )" ; then
-    readonly LAYOUT_XFS_OPT_DIR="$STORAGE_SAVED_DIR/xfs_options"
-    mkdir -p $v $LAYOUT_XFS_OPT_DIR
-fi
+# Save symlinks in /dev/ that point to kernel block device node names:
+readonly STORAGE_BLOCKDEV_SYMLINKS_FILE="$STORAGE_SAVED_DIR/block_device.symlinks"
+LogPrint "Saving symlinks in /dev/ that point to block devices to $STORAGE_BLOCKDEV_SYMLINKS_FILE"
+# See lib/layout-functions.sh how DATE is set: DATE=$( date +%Y%m%d%H%M%S )
+echo "# symlinks in /dev/ that point to kernel block device nodes dated $DATE (YYYYmmddHHMMSS)" >$STORAGE_BLOCKDEV_SYMLINKS_FILE
+local symlink symlink_target
+for symlink in $( find /dev -type l ) ; do
+    symlink_target=$( readlink -e $symlink )
+    test -b "$symlink_target" || continue
+    echo "$symlink_target $symlink"
+done | sort >>$STORAGE_BLOCKDEV_SYMLINKS_FILE
 
 # Save 'lsblk' output in human readable form and in computer readable form:
 has_binary lsblk || Error "The 'lsblk' command is required for saving storage info"
 REQUIRED_PROGS+=( lsblk )
 readonly STORAGE_LSBLK_OUTPUT_FILE="$STORAGE_SAVED_DIR/lsblk.output"
-Log "Saving 'lsblk' output to $STORAGE_LSBLK_OUTPUT_FILE"
-# See lib/layout-functions.sh how DATE is set: DATE=$( date +%Y%m%d%H%M%S )
+LogPrint "Saving 'lsblk' output to $STORAGE_LSBLK_OUTPUT_FILE"
 echo "'lsblk' output dated $DATE (YYYYmmddHHMMSS)" >$STORAGE_LSBLK_OUTPUT_FILE
 # Have the human readable 'lsblk' output as header comment
 # so that it is easier to make sense of the values in computer readable form.
@@ -65,7 +70,7 @@ echo "# 'parted' output dated $DATE (YYYYmmddHHMMSS)" >$STORAGE_PARTED_OUTPUT_FI
 # from the result KNAME="/dev/sda" we cut the second field /dev/sda with " field delimiter:
 local disk_kname parted_exit_code
 for disk_kname in $( grep 'TYPE="disk"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' KNAME="[^"]*"' | cut -d '"' -f2 ) ; do
-    Log "Saving 'parted' output for $disk_kname to $STORAGE_PARTED_OUTPUT_FILE"
+    LogPrint "Saving 'parted' output for $disk_kname to $STORAGE_PARTED_OUTPUT_FILE"
     # Have the human readable 'parted' output (with MiB values and discarded empty lines)
     # so that it is easier to make sense of the values in computer readable form.
     # Using # as sed 's' command delimiter because / is in $disk_kname (e.g. /dev/sda):
@@ -100,7 +105,7 @@ if has_binary mdadm ; then
     # so that it is documented when there is no 'mdadm' output but also
     # if there is no longer 'mdadm' output (e.g. when MD devices had been removed).
     REQUIRED_PROGS+=( mdadm )
-    Log "Saving 'mdadm' output to $STORAGE_MDADM_OUTPUT_FILE"
+    LogPrint "Saving 'mdadm' output to $STORAGE_MDADM_OUTPUT_FILE"
     echo "# 'mdadm' output dated $DATE (YYYYmmddHHMMSS)" >$STORAGE_MDADM_OUTPUT_FILE
     echo "# Output of mdadm --detail --scan" >>$STORAGE_MDADM_OUTPUT_FILE
     mdadm --detail --scan >>$STORAGE_MDADM_OUTPUT_FILE || Error "Required command 'mdadm --detail --scan' failed with exit code $?"
@@ -136,5 +141,8 @@ else
     # Document that there is no 'mdadm' command (also to overwrite possibly outdated STORAGE_MDADM_OUTPUT_FILE content):
     echo "# No 'mdadm' output because there is no 'mdadm' command dated $DATE (YYYYmmddHHMMSS)" >$STORAGE_MDADM_OUTPUT_FILE
 fi
+
+
+LogPrint "Saved storage info"
 
 

@@ -143,11 +143,22 @@ for disk_kname in $( grep 'TYPE="disk"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' K
                 continue
             fi
         done
-
     done
-
 done
 
+# Create MD devices aka Linux Software RAID:
+# For all 'raid...' type kernel device names in STORAGE_LSBLK_OUTPUT_FILE
+# create MD devices according to the 'mdadm' output in STORAGE_MDADM_OUTPUT_FILE:
+local raid_kname
+for raid_kname in $( grep 'TYPE="raid.*"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' KNAME="[^"]*"' | cut -d '"' -f2 ) ; do
+    Log "Creating MD devices for $raid_kname according to $STORAGE_MDADM_OUTPUT_FILE"
+    if ! grep -q "^$raid_kname " $STORAGE_MDADM_OUTPUT_FILE ; then
+        LogPrintError "Cannot create MD devices for $raid_kname (no info found in $STORAGE_MDADM_OUTPUT_FILE)"
+        continue
+    fi
+
+
+done
 
 unset -f wait_for_device_node
 
