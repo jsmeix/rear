@@ -8,6 +8,8 @@ WORKFLOW_mkbackup () {
 
 	SourceStage "prep"
 
+	SourceStage "storage/save"
+
 	SourceStage "layout/save"
 
 	SourceStage "rescue"

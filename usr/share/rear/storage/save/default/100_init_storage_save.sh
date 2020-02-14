@@ -138,5 +138,3 @@ else
 fi
 
 
-Error "End at ${BASH_SOURCE[0]}"
-
