@@ -29,6 +29,8 @@ function WORKFLOW_recover () {
 
     SourceStage "verify"
 
+    SourceStage "storage/recreate"
+
     SourceStage "layout/prepare"
     SourceStage "layout/recreate"
 

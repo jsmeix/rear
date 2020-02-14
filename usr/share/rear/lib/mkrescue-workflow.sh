@@ -11,6 +11,8 @@ WORKFLOW_mkrescue () {
 
 	SourceStage "prep"
 
+	SourceStage "storage/save"
+
 	SourceStage "layout/save"
 
 	SourceStage "rescue"
