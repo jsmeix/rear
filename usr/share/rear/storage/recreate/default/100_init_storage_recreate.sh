@@ -3,6 +3,7 @@
 # initializes directories and files when storage gets recreated
 
 readonly STORAGE_SAVED_DIR="$VAR_DIR/storage/saved"
+readonly STORAGE_BLOCKDEV_SYMLINKS_FILE="$STORAGE_SAVED_DIR/block_device.symlinks"
 readonly STORAGE_LSBLK_OUTPUT_FILE="$STORAGE_SAVED_DIR/lsblk.output"
 readonly STORAGE_PARTED_OUTPUT_FILE="$STORAGE_SAVED_DIR/parted.output"
 readonly STORAGE_MDADM_OUTPUT_FILE="$STORAGE_SAVED_DIR/mdadm.output"
@@ -15,13 +16,13 @@ mkdir -p $v "$STORAGE_RECREATING_DIR"
 readonly STORAGE_RECREATED_DIR="$VAR_DIR/storage/recreated"
 mkdir -p $v "$STORAGE_RECREATED_DIR"
 
-# Wipe existing partitions from all disks in reverse ordering, for example
-# first /dev/sdb2 then /dev/sdb1 then /dev/sdb then /dev/sda2 then /dev/sda1 finally /dev/sda
-# cf. https://github.com/rear/rear/issues/799
-local disk_or_part_kname
-for disk_or_part_kname in $( lsblk -ipo TYPE,KNAME | egrep '^disk |^part ' | tac | tr -s ' ' |  cut -d ' ' -f2 ) ; do
-    wipefs -a -f $disk_or_part_kname && LogPrint "Wiped $disk_or_part_kname by 'wipefs -a -f'" || LogPrintError "Failed to wipe $disk_or_part_kname by 'wipefs -a -f'"
-done
+# Cf. https://github.com/rear/rear/issues/2254#issuecomment-545506104
+# Output the kernel block device names in var/lib/rear/storage/saved/block_device.symlinks
+# that match the argument (separated by each other with newline):
+function kernel_block_device_names () {
+    local block_device_regexp="$1"
+    grep "$block_device_regexp" $STORAGE_BLOCKDEV_SYMLINKS_FILE | cut -d ' ' -f1 | sort -u
+}
 
 # Cf. https://github.com/rear/rear/issues/791
 function wait_for_device_node () {
@@ -31,6 +32,7 @@ function wait_for_device_node () {
     is_positive_integer $timeout 1>/dev/null || timeout=10
     local countdown
     for countdown in $( seq $timeout -1 0 ) ; do
+        # 'test -b device_node' is also 'true' when device_node is a symlink to a block device:
         test -b $device_node && return 0
         # Skip to show the message for the very first time (i.e. wait the first second silently)
         # to avoid needless user messages when device nodes appear within less than one second.
@@ -43,13 +45,26 @@ function wait_for_device_node () {
     return 1
 }
 
+# Wipe existing partitions from all disks in reverse ordering,
+# first partitions in reverse ordering
+# for example /dev/sdb2 then /dev/sdb1 then /dev/sda3 then /dev/sda2 then /dev/sda1
+# then disks in reverse ordering
+# for example /dev/sdb then /dev/sda
+# cf. https://github.com/rear/rear/issues/799
+local type kname
+for type in part disk ; do
+    for kname in $( lsblk -ipo TYPE,KNAME | grep "^$type " | tac | tr -s ' ' |  cut -d ' ' -f2 ) ; do
+        wipefs -a -f $kname && LogPrint "Wiped $kname by 'wipefs -a -f'" || LogPrintError "Failed to wipe $kname by 'wipefs -a -f'"
+    done
+done
+
 # For all 'disk' type kernel device names in STORAGE_LSBLK_OUTPUT_FILE
 # create partitions according to the 'parted' output in STORAGE_PARTED_OUTPUT_FILE:
 local disk_kname partition_number partition_parted_line missing_partition
 local partition_start_byte partition_start_number partition_end_byte partition_end_number partition_filesystem_type gpt_partition_name
 local partition_flags partition_flag
 for disk_kname in $( grep 'TYPE="disk"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' KNAME="[^"]*"' | cut -d '"' -f2 ) ; do
-    Log "Creating partitions on $disk_kname according to $STORAGE_PARTED_OUTPUT_FILE"
+    LogPrint "Creating partitions on $disk_kname according to $STORAGE_PARTED_OUTPUT_FILE"
     if ! grep -q "^$disk_kname " $STORAGE_PARTED_OUTPUT_FILE ; then
         LogPrintError "Cannot create partitions on $disk_kname (no info found in $STORAGE_PARTED_OUTPUT_FILE)"
         continue
@@ -86,6 +101,7 @@ for disk_kname in $( grep 'TYPE="disk"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' K
         is_true $missing_partition && BugError "Failed to create partitions on $disk_kname (only consecutive partitions are currently supported)"
         # Currently only the usual (i.e. minimal) GPT up to 128 partitions is supported:
         test "129" = "$partition_number" && BugError "Failed to create partitions on $disk_kname (only up to 128 partitions are currently supported)"
+        LogPrint "Creating partition $partition_number on $disk_kname"
         # Get the values from the 'parted -m' output line which look for example like
         #   /dev/sda 5:17180917760B:19328401407B:2147483648B:ext2:sda5:raid, legacy_boot;
         # with the following syntax for 'parted -m' output for "BYT" with our added disk_kname prefix
@@ -119,7 +135,7 @@ for disk_kname in $( grep 'TYPE="disk"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' K
         # so we have to set a fallback value when $gpt_partition_name is empty:
         test "$gpt_partition_name" || gpt_partition_name="$( basename $disk_kname )$partition_number"
         if ! parted -s $disk_kname mkpart "$gpt_partition_name" "$partition_filesystem_type" $partition_start_byte $partition_end_byte ; then
-            LogPrintError "Failed to create partition $partition_number on $disk_kname ('parted -s $disk_kname mkpart '$gpt_partition_name''$partition_filesystem_type' $partition_start_byte $partition_end_byte' failed)"
+            LogPrintError "Failed to create partition $partition_number on $disk_kname ('parted -s $disk_kname mkpart '$gpt_partition_name' '$partition_filesystem_type' $partition_start_byte $partition_end_byte' failed)"
             continue
         fi
         # For example the flags-set entry in the 'parted -m' output line is
@@ -147,20 +163,78 @@ for disk_kname in $( grep 'TYPE="disk"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' K
 done
 
 # Create MD devices aka Linux Software RAID:
-# For all 'raid...' type kernel device names in STORAGE_LSBLK_OUTPUT_FILE
+# For all listed 'ARRAY' device names (symlinks) in STORAGE_MDADM_OUTPUT_FILE
 # create MD devices according to the 'mdadm' output in STORAGE_MDADM_OUTPUT_FILE:
-local raid_kname
-for raid_kname in $( grep 'TYPE="raid.*"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' KNAME="[^"]*"' | cut -d '"' -f2 ) ; do
-    Log "Creating MD devices for $raid_kname according to $STORAGE_MDADM_OUTPUT_FILE"
-    if ! grep -q "^$raid_kname " $STORAGE_MDADM_OUTPUT_FILE ; then
-        LogPrintError "Cannot create MD devices for $raid_kname (no info found in $STORAGE_MDADM_OUTPUT_FILE)"
+local raid_array_name
+local mdadm_detail_line extracted_value
+local raid_level raid_devices total_devices
+local raid_block_device_nodes raid_block_device_node
+LogPrint "Creating MD devices (aka Linux Software RAID) according to $STORAGE_MDADM_OUTPUT_FILE"
+for raid_array_name in $( grep '^ARRAY ' $STORAGE_MDADM_OUTPUT_FILE | cut -d ' ' -f2 ) ; do
+    LogPrint "Creating software RAID $raid_array_name"
+    # Minimal 'mdadm' command to create a RAID array:
+    #   mdadm --create $raid_array_name --level=$raid_level --raid-devices=$raid_devices $raid_block_device_nodes
+    # for example
+    #   mdadm --create MyArray --level=raid1 --raid-devices=2 /dev/sda2 /dev/sdb2
+    raid_level=""
+    raid_devices=""
+    total_devices=""
+    raid_block_device_nodes=""
+    while read mdadm_detail_line ; do
+        # Example 'Raid Level' line:
+        #          Raid Level : raid1
+        # Because things in $(...) run in a subshell we can 'set -o pipefail' therein
+        # to find out if the pipe that tries to extract a particular value was successful
+        # ('set -o pipefail' is in particular needed to test if 'grep' was successful)
+        # and assign the extracted value only if the extraction was successful:
+        extracted_value="$( set -o pipefail ; grep 'Raid Level :' <<<"$mdadm_detail_line" | cut -d ':' -f2 | tr -d '[:space:]' )" && raid_level="$extracted_value"
+        # Example 'Raid Devices' line:
+        #        Raid Devices : 2
+        extracted_value="$( set -o pipefail ; grep 'Raid Devices :' <<<"$mdadm_detail_line" | cut -d ':' -f2 | tr -d '[:space:]' )" && raid_devices="$extracted_value"
+        # Example 'Total Devices' line:
+        #       Total Devices : 3
+        extracted_value="$( set -o pipefail ; grep 'Total Devices :' <<<"$mdadm_detail_line" | cut -d ':' -f2 | tr -d '[:space:]' )" && total_devices="$extracted_value"
+        # Example lines that list the RAID array devices:
+        #      Number   Major   Minor   RaidDevice State
+        #         0       8        2        0      active sync   /dev/sda2
+        #         1       8       18        1      active sync   /dev/sdb2
+        extracted_value="$( set -o pipefail ; grep -o ' /dev/.*' <<<"$mdadm_detail_line" | tr -d '[:space:]' )" && raid_block_device_nodes+=" $extracted_value"
+    done < <( grep "^$raid_array_name " $STORAGE_MDADM_OUTPUT_FILE | sed -e "s#^$raid_array_name ##" )
+    # Check RAID devices number:
+    if ! test $raid_devices -eq $total_devices ; then
+        BugError "Cannot create $raid_array_name (RAID devices $raid_devices != $total_devices total devices is currently not supported)"
+        continue
+    fi
+    # Verify that the RAID array devices exist:
+    for raid_block_device_node in $raid_block_device_nodes ; do
+        if ! wait_for_device_node $raid_block_device_node ; then
+            LogPrintError "Cannot create RAID $raid_array_name (needed RAID device $disk_kname does not exist or did not appear)"
+            continue 2
+        fi
+    done
+    # TODO: Verify that the RAID array devices exist as partitions with the 'raid' partition flag set:
+
+    # Create the RAID array.
+    # There is no 'mdadm' option to enforce non-interactive mode so we feed some 'y' into it to respond positively to its questions:
+    if ! echo -e 'y\ny\ny\ny\ny\ny\ny' | mdadm --create $raid_array_name --level=$raid_level --raid-devices=$raid_devices $raid_block_device_nodes ; then
+         LogPrintError "Failed to create RAID $raid_array_name ('mdadm --create $raid_array_name --level=$raid_level --raid-devices=$raid_devices $raid_block_device_nodes' failed)"
         continue
     fi
 
-
 done
 
+#local raid_kname
+#for raid_kname in $( grep 'TYPE="raid.*"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' KNAME="[^"]*"' | cut -d '"' -f2 ) ; do
+#    Log "Creating MD devices for $raid_kname according to $STORAGE_MDADM_OUTPUT_FILE"
+#    if ! grep -q "^$raid_kname " $STORAGE_MDADM_OUTPUT_FILE ; then
+#        LogPrintError "Cannot create MD devices for $raid_kname (no info found in $STORAGE_MDADM_OUTPUT_FILE)"
+#        continue
+#    fi
+#
+#done
+
 unset -f wait_for_device_node
+unset -f kernel_block_device_names
 
 Error "End at ${BASH_SOURCE[0]}"
 
