@@ -2,9 +2,13 @@
 # storage/save/default/100_init_storage_save.sh
 # initializes directories and files where to storage info gets saved.
 
+local pipe_exit_codes=()
+local pipe_commands=()
+local pipe_command
+
 LogPrint "Saving storage info (disks, partitions, filesystems, mountpoints, ...)"
 
-Debug "Creating directories where to storage info gets saved (when not existing)"
+Debug "Creating directories where to storage info gets saved (if not existing)"
 readonly STORAGE_SAVED_DIR="$VAR_DIR/storage/saved"
 mkdir -p $v "$STORAGE_SAVED_DIR"
 
@@ -26,6 +30,8 @@ REQUIRED_PROGS+=( lsblk )
 readonly STORAGE_LSBLK_OUTPUT_FILE="$STORAGE_SAVED_DIR/lsblk.output"
 LogPrint "Saving 'lsblk' output to $STORAGE_LSBLK_OUTPUT_FILE"
 echo "'lsblk' output dated $DATE (YYYYmmddHHMMSS)" >$STORAGE_LSBLK_OUTPUT_FILE
+echo "Output of lsblk --version" >>$STORAGE_LSBLK_OUTPUT_FILE
+lsblk --version >>$STORAGE_LSBLK_OUTPUT_FILE 2>&1 || echo "'lsblk --version' failed with exit code $? (probably too old 'lsblk')" >>$STORAGE_LSBLK_OUTPUT_FILE
 # Have the human readable 'lsblk' output as header comment
 # so that it is easier to make sense of the values in computer readable form.
 # First try the command
@@ -48,7 +54,9 @@ lsblk -bpPO >>$STORAGE_LSBLK_OUTPUT_FILE || Error "Required command 'lsblk -bpPO
 has_binary parted || Error "The 'parted' command is required for saving storage info"
 REQUIRED_PROGS+=( parted )
 readonly STORAGE_PARTED_OUTPUT_FILE="$STORAGE_SAVED_DIR/parted.output"
-echo "# 'parted' output dated $DATE (YYYYmmddHHMMSS)" >$STORAGE_PARTED_OUTPUT_FILE
+echo "'parted' output dated $DATE (YYYYmmddHHMMSS)" >$STORAGE_PARTED_OUTPUT_FILE
+echo "Output of parted --version" >>$STORAGE_PARTED_OUTPUT_FILE
+parted --version >>$STORAGE_PARTED_OUTPUT_FILE 2>&1 || echo "'parted --version' failed with exit code $?" >>$STORAGE_PARTED_OUTPUT_FILE
 # Provide the 'parted -m' output format description as comment
 # so that it is easier to make sense of the values in computer readable form.
 { echo ' Brief description of the "parted -m" machine parseable output format, cf.
@@ -62,8 +70,10 @@ echo "# 'parted' output dated $DATE (YYYYmmddHHMMSS)" >$STORAGE_PARTED_OUTPUT_FI
  information on no. of cylinders, heads, sectors and cylinder size.
  Partition information begins from the next line. This is of the format:
  (for BYT) "number":"begin":"end":"size":"filesystem-type":"partition-name":"flags-set";
- (for CHS/CYL) "number":"begin":"end":"filesystem-type":"partition-name":"flags-set"; ' | sed -e 's/^/#/'
+ (for CHS/CYL) "number":"begin":"end":"filesystem-type":"partition-name":"flags-set"; '
 } >>$STORAGE_PARTED_OUTPUT_FILE
+# Make all lines up to now as header comments:
+sed -i -e 's/^/# /' $STORAGE_PARTED_OUTPUT_FILE
 # A 'lsblk -bpPO' output line looks like (excerpts):
 #   NAME="/dev/sda" KNAME="/dev/sda" ... TYPE="disk" ... PKNAME="" ...
 # so we grep for ' KNAME=...' with a leading blank to exclude 'PKNAME' and
@@ -80,21 +90,31 @@ for disk_kname in $( grep 'TYPE="disk"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' K
     } >>$STORAGE_PARTED_OUTPUT_FILE
     # Save the 'parted' output in computer readable form (with byte values)
     # with the kernel device name as line prefix added.
-    # Using # as sed 's' command delimiter because / is in $disk_kname (e.g. /dev/sda).
-    # Using a subshell to run the pipe with 'set -o pipefail' in a separated environment
-    # but a drawback of the subshell is that we cannot get "${PIPESTATUS[@]}" out of it
-    # so we cannot determine what command in the pipe had failed and therefore
-    # we assume 'sed' never fails and report "parted failed" if there was any failure and
-    # accordingly we also assume the subshell return code is the exit code from parted:
-    ( set -o pipefail
-      parted -sm $disk_kname unit B print | sed -e "s#^#$disk_kname #"
-    ) >>$STORAGE_PARTED_OUTPUT_FILE
-    parted_exit_code=$?
-    if test $parted_exit_code -ne 0 ; then
-        # Document in STORAGE_PARTED_OUTPUT_FILE that the 'parted' command had failed:
-        echo "### Non zero exit code $parted_exit_code from parted -sm $disk_kname unit B print" >>$STORAGE_PARTED_OUTPUT_FILE
-        Error "Required command 'parted -sm $disk_kname unit B print' failed with exit code $parted_exit_code"
-    fi
+    # Using # as sed 's' command delimiter because / is in $disk_kname (e.g. /dev/sda):
+    parted -sm $disk_kname unit B print | sed -e "s#^#$disk_kname #" >>$STORAGE_PARTED_OUTPUT_FILE
+    pipe_exit_codes=( "${PIPESTATUS[@]}" )
+    pipe_commands=( "parted -sm $disk_kname unit B print" "sed -e 's#^#$disk_kname #'" )
+    for pipe_command in parted sed ; do
+        case "$pipe_command" in
+            (parted)
+                # Continue the foor loop with the next pipe_command when this one succeeded:
+                test ${pipe_exit_codes[0]} -eq 0 && continue
+                # Document in STORAGE_PARTED_OUTPUT_FILE that the 'parted' command had failed:
+                echo "### Non zero exit code ${pipe_exit_codes[0]} from ${pipe_commands[0]}" >>$STORAGE_PARTED_OUTPUT_FILE
+                Error "Required command '${pipe_commands[0]}' failed with exit code ${pipe_exit_codes[0]}"
+                ;;
+            (sed)
+                # Break the foor loop when the last pipe_command succeeded:
+                test ${pipe_exit_codes[1]} -eq 0 && break
+                # Document in STORAGE_PARTED_OUTPUT_FILE that the 'sed' command had failed:
+                echo "### Non zero exit code ${pipe_exit_codes[1]} from ... | ${pipe_commands[1]}" >>$STORAGE_PARTED_OUTPUT_FILE
+                Error "Required command '... | ${pipe_commands[1]}' failed with exit code ${pipe_exit_codes[1]}"
+                ;;
+            (*)
+                BugError "'for pipe_command in ...' loop run with invalid pipe_command value '$pipe_command'"
+                ;;
+        esac
+    done
 done
 
 # Save the 'mdadm' output for MD devices aka Linux Software RAID:
@@ -105,9 +125,12 @@ if has_binary mdadm ; then
     # so that it is documented when there is no 'mdadm' output but also
     # if there is no longer 'mdadm' output (e.g. when MD devices had been removed).
     REQUIRED_PROGS+=( mdadm )
-    LogPrint "Saving 'mdadm' output to $STORAGE_MDADM_OUTPUT_FILE"
-    echo "# 'mdadm' output dated $DATE (YYYYmmddHHMMSS)" >$STORAGE_MDADM_OUTPUT_FILE
-    echo "# Output of mdadm --detail --scan" >>$STORAGE_MDADM_OUTPUT_FILE
+    echo "'mdadm' output dated $DATE (YYYYmmddHHMMSS)" >$STORAGE_MDADM_OUTPUT_FILE
+    echo "Output of mdadm --version" >>$STORAGE_MDADM_OUTPUT_FILE
+    mdadm --version >>$STORAGE_MDADM_OUTPUT_FILE 2>&1 || echo "'mdadm --version' failed with exit code $?" >>$STORAGE_MDADM_OUTPUT_FILE
+    echo "Output of mdadm --detail --scan" >>$STORAGE_MDADM_OUTPUT_FILE
+    # Make all lines up to now as header comments:
+    sed -i -e 's/^/# /' $STORAGE_MDADM_OUTPUT_FILE
     mdadm --detail --scan >>$STORAGE_MDADM_OUTPUT_FILE || Error "Required command 'mdadm --detail --scan' failed with exit code $?"
     # A normal 'mdadm --detail --scan' output line looks like:
     #   ARRAY /dev/md/arrayname metadata=1.0 name=hostname:arrayname UUID=43f60cda:d221604f:5d3438a3:8c225f70
@@ -115,24 +138,40 @@ if has_binary mdadm ; then
     # from the result we cut the second field /dev/md/arrayname with ' ' field delimiter:
     local md_device mdadm_exit_code
     for md_device in $( grep '^ARRAY ' $STORAGE_MDADM_OUTPUT_FILE | cut -d ' ' -f2 ) ; do
+        LogPrint "Saving 'mdadm' output for $md_device to $STORAGE_MDADM_OUTPUT_FILE"
         echo "### Output of mdadm --detail $md_device (with $md_device prefix added)" >>$STORAGE_MDADM_OUTPUT_FILE
         # For each ARRAY MD device in STORAGE_MDADM_OUTPUT_FILE save the details
         # with the ARRAY MD device name as line prefix added (and discarded empty lines).
-        # Using # as sed 's' command delimiter because / is in $md_device (like /dev/md/arrayname).
-        # Using a subshell to run the pipe with 'set -o pipefail' in a separated environment
-        # but a drawback of the subshell is that we cannot get "${PIPESTATUS[@]}" out of it
-        # so we cannot determine what command in the pipe had failed and therefore
-        # we assume 'grep' and 'sed' never fail and report "mdadm failed" if there was any failure
-        # and accordingly we also assume the subshell return code is the exit code from mdadm:
-        ( set -o pipefail
-          mdadm --detail $md_device | grep -v '^$' | sed -e "s#^#$md_device #"
-        ) >>$STORAGE_MDADM_OUTPUT_FILE
-        mdadm_exit_code=$?
-        if test $mdadm_exit_code -ne 0 ; then
-            # Document in STORAGE_MDADM_OUTPUT_FILE that the 'mdadm' command had failed:
-            echo "### Non zero exit code $mdadm_exit_code from mdadm --detail $md_device" >>$STORAGE_MDADM_OUTPUT_FILE
-            Error "Required command 'mdadm --detail $md_device' failed with exit code $mdadm_exit_code"
-        fi
+        # Using # as sed 's' command delimiter because / is in $md_device (like /dev/md/arrayname):
+        mdadm --detail $md_device | grep -v '^$' | sed -e "s#^#$md_device #" >>$STORAGE_MDADM_OUTPUT_FILE
+        pipe_exit_codes=( "${PIPESTATUS[@]}" )
+        pipe_commands=( "mdadm --detail $md_device" "grep -v '^$'" "sed -e 's#^#$disk_kname #'" )
+        for pipe_command in mdadm grep sed ; do
+            case "$pipe_command" in
+                (mdadm)
+                    # Continue the foor loop with the next pipe_command when this one succeeded:
+                    test ${pipe_exit_codes[0]} -eq 0 && continue
+                    # Document in STORAGE_MDADM_OUTPUT_FILE that the 'mdadm' command had failed:
+                    echo "### Non zero exit code ${pipe_exit_codes[0]} from ${pipe_commands[0]}" >>$STORAGE_MDADM_OUTPUT_FILE
+                    Error "Required command '${pipe_commands[0]}' failed with exit code ${pipe_exit_codes[0]}"
+                    ;;
+                (grep)
+                    # Continue the foor loop with the next pipe_command when this one succeeded:
+                    test ${pipe_exit_codes[1]} -eq 0 && continue
+                    Log "Command '... | ${pipe_commands[1]} | ...' failed with exit code ${pipe_exit_codes[1]}"
+                    ;;
+                (sed)
+                    # Break the foor loop when the last pipe_command succeeded:
+                    test ${pipe_exit_codes[2]} -eq 0 && break
+                    # Document in STORAGE_PARTED_OUTPUT_FILE that the 'sed' command had failed:
+                    echo "### Non zero exit code ${pipe_exit_codes[2]} from ... | ${pipe_commands[2]}" >>$STORAGE_PARTED_OUTPUT_FILE
+                    Error "Required command '... | ${pipe_commands[2]}' failed with exit code ${pipe_exit_codes[2]}"
+                    ;;
+                (*)
+                    BugError "'for pipe_command in ...' loop run with invalid pipe_command value"
+                    ;;
+            esac
+        done
     done
 else
     # When there are 'raid[0-9]*' TYPE entries in the 'lsblk' output
