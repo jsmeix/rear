@@ -7,6 +7,7 @@ readonly STORAGE_BLOCKDEV_SYMLINKS_FILE="$STORAGE_SAVED_DIR/block_device.symlink
 readonly STORAGE_LSBLK_OUTPUT_FILE="$STORAGE_SAVED_DIR/lsblk.output"
 readonly STORAGE_PARTED_OUTPUT_FILE="$STORAGE_SAVED_DIR/parted.output"
 readonly STORAGE_MDADM_OUTPUT_FILE="$STORAGE_SAVED_DIR/mdadm.output"
+readonly STORAGE_LVM_OUTPUT_FILE="$STORAGE_SAVED_DIR/lvm.output"
 
 LogPrint "Recreating storage according to the files in $STORAGE_SAVED_DIR"
 
@@ -45,6 +46,12 @@ function wait_for_device_node () {
     return 1
 }
 
+# When there are TYPE="raid.*" devices in STORAGE_LSBLK_OUTPUT_FILE
+# shut down all MD devices aka Linux Software RAID arrays that can be shut down (i.e. that are not currently in use):
+if grep -q 'TYPE="raid.*"' $STORAGE_LSBLK_OUTPUT_FILE ; then
+    mdadm --stop --scan || LogPrintError "Cannot shut down software RAID arrays ('mdadm --stop --scan' failed)"
+fi
+
 # Wipe existing partitions from all disks in reverse ordering,
 # first partitions in reverse ordering
 # for example /dev/sdb2 then /dev/sdb1 then /dev/sda3 then /dev/sda2 then /dev/sda1
@@ -53,7 +60,7 @@ function wait_for_device_node () {
 # cf. https://github.com/rear/rear/issues/799
 local type kname
 for type in part disk ; do
-    for kname in $( lsblk -ipo TYPE,KNAME | grep "^$type " | tac | tr -s ' ' |  cut -d ' ' -f2 ) ; do
+    for kname in $( lsblk -ipo TYPE,KNAME | grep "^$type " | tac | tr -s '[:blank:]' ' ' |  cut -d ' ' -f2 ) ; do
         wipefs -a -f $kname && LogPrint "Wiped $kname by 'wipefs -a -f'" || LogPrintError "Failed to wipe $kname by 'wipefs -a -f'"
     done
 done
@@ -208,30 +215,30 @@ for raid_array_name in $( grep '^ARRAY ' $STORAGE_MDADM_OUTPUT_FILE | cut -d ' '
     # Verify that the RAID array devices exist:
     for raid_block_device_node in $raid_block_device_nodes ; do
         if ! wait_for_device_node $raid_block_device_node ; then
-            LogPrintError "Cannot create RAID $raid_array_name (needed RAID device $disk_kname does not exist or did not appear)"
+            LogPrintError "Cannot create RAID $raid_array_name (needed RAID device $raid_block_device_node does not exist or did not appear)"
             continue 2
         fi
     done
-    # TODO: Verify that the RAID array devices exist as partitions with the 'raid' partition flag set:
-
     # Create the RAID array.
-    # There is no 'mdadm' option to enforce non-interactive mode so we feed some 'y' into it to respond positively to its questions:
-    if ! echo -e 'y\ny\ny\ny\ny\ny\ny' | mdadm --create $raid_array_name --level=$raid_level --raid-devices=$raid_devices $raid_block_device_nodes ; then
+    # There is no 'mdadm' option to enforce non-interactive mode so we feed 'y' into it to respond positively to all its questions
+    # (there is no 'yes' program like /usr/bin/yes in the ReaR recovery system so we feed an unlimited amount of 'y' manually).
+    # The while loop ends with exit code 141 which means 141 - 128 = 13 = SIGPIPE when 'mdadm' finishes
+    # and the exit code of the pipe is the exit code of its last command so we test the 'mdadm' exit code:
+    if ! while true ; do echo 'y' ; done | mdadm --create $raid_array_name --level=$raid_level --raid-devices=$raid_devices $raid_block_device_nodes ; then
          LogPrintError "Failed to create RAID $raid_array_name ('mdadm --create $raid_array_name --level=$raid_level --raid-devices=$raid_devices $raid_block_device_nodes' failed)"
         continue
     fi
+done
+
+# Create LVM physical volumes, LVM volume groups, and LVM logical volumes:
+local lvm_pv_name
+LogPrint "Creating LVM physical volumes, LVM volume groups, and LVM logical volumes according to $STORAGE_LVM_OUTPUT_FILE"
+for lvm_pv_name in $( grep '^LVM physical volume names ' $STORAGE_LVM_OUTPUT_FILE | cut -d ' ' -f5- ) ; do
+    LogPrint "Creating LVM physical volume $lvm_pv_name"
+
 
 done
 
-#local raid_kname
-#for raid_kname in $( grep 'TYPE="raid.*"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' KNAME="[^"]*"' | cut -d '"' -f2 ) ; do
-#    Log "Creating MD devices for $raid_kname according to $STORAGE_MDADM_OUTPUT_FILE"
-#    if ! grep -q "^$raid_kname " $STORAGE_MDADM_OUTPUT_FILE ; then
-#        LogPrintError "Cannot create MD devices for $raid_kname (no info found in $STORAGE_MDADM_OUTPUT_FILE)"
-#        continue
-#    fi
-#
-#done
 
 unset -f wait_for_device_node
 unset -f kernel_block_device_names

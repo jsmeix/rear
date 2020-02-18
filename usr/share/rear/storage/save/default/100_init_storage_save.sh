@@ -85,7 +85,7 @@ for disk_kname in $( grep 'TYPE="disk"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' K
     # so that it is easier to make sense of the values in computer readable form.
     # Using # as sed 's' command delimiter because / is in $disk_kname (e.g. /dev/sda):
     { echo "##### Output of parted -s $disk_kname unit MiB print (with $disk_kname prefix added)"
-      parted -s $disk_kname unit MiB print | grep -v '^$' | sed -e "s#^#$disk_kname #"
+      parted -s $disk_kname unit MiB print | grep -v '^[[:space:]]*$' | sed -e "s#^#$disk_kname #"
       echo "### Output of parted -sm $disk_kname unit B print (with $disk_kname prefix added)"
     } >>$STORAGE_PARTED_OUTPUT_FILE
     # Save the 'parted' output in computer readable form (with byte values)
@@ -143,9 +143,9 @@ if has_binary mdadm ; then
         # For each ARRAY MD device in STORAGE_MDADM_OUTPUT_FILE save the details
         # with the ARRAY MD device name as line prefix added (and discarded empty lines).
         # Using # as sed 's' command delimiter because / is in $md_device (like /dev/md/arrayname):
-        mdadm --detail $md_device | grep -v '^$' | sed -e "s#^#$md_device #" >>$STORAGE_MDADM_OUTPUT_FILE
+        mdadm --detail $md_device | grep -v '^[[:space:]]*$' | sed -e "s#^#$md_device #" >>$STORAGE_MDADM_OUTPUT_FILE
         pipe_exit_codes=( "${PIPESTATUS[@]}" )
-        pipe_commands=( "mdadm --detail $md_device" "grep -v '^$'" "sed -e 's#^#$disk_kname #'" )
+        pipe_commands=( "mdadm --detail $md_device" "grep -v '^[[:space:]]*$'" "sed -e 's#^#$disk_kname #'" )
         for pipe_command in mdadm grep sed ; do
             case "$pipe_command" in
                 (mdadm)
@@ -164,7 +164,7 @@ if has_binary mdadm ; then
                     # Break the foor loop when the last pipe_command succeeded:
                     test ${pipe_exit_codes[2]} -eq 0 && break
                     # Document in STORAGE_PARTED_OUTPUT_FILE that the 'sed' command had failed:
-                    echo "### Non zero exit code ${pipe_exit_codes[2]} from ... | ${pipe_commands[2]}" >>$STORAGE_PARTED_OUTPUT_FILE
+                    echo "### Non zero exit code ${pipe_exit_codes[2]} from ... | ${pipe_commands[2]}" >>$STORAGE_MDADM_OUTPUT_FILE
                     Error "Required command '... | ${pipe_commands[2]}' failed with exit code ${pipe_exit_codes[2]}"
                     ;;
                 (*)
@@ -179,6 +179,86 @@ else
     grep -q 'TYPE="raid[^"]*"' $STORAGE_LSBLK_OUTPUT_FILE && Error "The 'mdadm' command is required for saving storage info"
     # Document that there is no 'mdadm' command (also to overwrite possibly outdated STORAGE_MDADM_OUTPUT_FILE content):
     echo "# No 'mdadm' output because there is no 'mdadm' command dated $DATE (YYYYmmddHHMMSS)" >$STORAGE_MDADM_OUTPUT_FILE
+fi
+
+# Save the 'lvm' output for LVM physical volumes, LVM volume groups, and LVM logical volumes:
+readonly STORAGE_LVM_OUTPUT_FILE="$STORAGE_SAVED_DIR/lvm.output"
+if has_binary lvm ; then
+    # Regardless whether or not LVM volumes are actually currently used,
+    # when the 'lvm' command is there we save its output even if it is empty
+    # so that it is documented when there is no 'lvm' output but also
+    # if there is no longer 'lvm' output (e.g. when LVM volumes devices had been removed).
+    REQUIRED_PROGS+=( lvm )
+    echo "'lvm' output dated $DATE (YYYYmmddHHMMSS)" >$STORAGE_LVM_OUTPUT_FILE
+    echo "Output of lvm version" >>$STORAGE_LVM_OUTPUT_FILE
+    lvm version >>$STORAGE_LVM_OUTPUT_FILE 2>&1 || echo "'lvm version' failed with exit code $?" >>$STORAGE_LVM_OUTPUT_FILE
+    echo "Output of lvm pvs" >>$STORAGE_LVM_OUTPUT_FILE
+    lvm pvs --separator ' | ' --aligned >>$STORAGE_LVM_OUTPUT_FILE 2>&1 || echo "'lvm pvs' failed with exit code $?" >>$STORAGE_LVM_OUTPUT_FILE
+    echo "Output of lvm vgs" >>$STORAGE_LVM_OUTPUT_FILE
+    lvm vgs --separator ' | ' --aligned >>$STORAGE_LVM_OUTPUT_FILE 2>&1 || echo "'lvm vgs' failed with exit code $?" >>$STORAGE_LVM_OUTPUT_FILE
+    echo "Output of lvm lvs" >>$STORAGE_LVM_OUTPUT_FILE
+    lvm lvs --separator ' | ' --aligned >>$STORAGE_LVM_OUTPUT_FILE 2>&1 || echo "'lvm lvs' failed with exit code $?" >>$STORAGE_LVM_OUTPUT_FILE
+    echo "Output of lvm fullreport" >>$STORAGE_LVM_OUTPUT_FILE
+    lvm fullreport --separator ' | ' --aligned >>$STORAGE_LVM_OUTPUT_FILE 2>&1 || echo "'lvm fullreport' failed with exit code $?" >>$STORAGE_LVM_OUTPUT_FILE
+    # Make all lines up to now as header comments:
+    sed -i -e 's/^/# /' $STORAGE_LVM_OUTPUT_FILE
+    # Output for LVM physical volumes:
+    local lvm_pv_names lvm_pv_name
+    # Usually the 'lvm pvs -o pv_name --rows --noheadings' output looks like
+    #   /dev/sdb2 /dev/sdc3 /dev/md125 /dev/md126
+    # (with two leading space characters):
+    lvm_pv_names="$( lvm pvs -o pv_name --rows --noheadings )" || Error "Required command 'lvm pvs -o pv_name --rows --noheadings' failed with exit code $?"
+    echo "##### Output of lvm pvs -o pv_name --rows --noheadings (with 'LVM physical volume names' prefix added)" >>$STORAGE_LVM_OUTPUT_FILE
+    # Having $lvm_pv_names outside of the "..." (as separated arguments) removes its two leading space characters in the 'echo' output
+    # ('help echo' reads: "Display the ARGs, separated by a single space character" so "echo  foo  bar " outputs 'foo bar'):
+    echo "LVM physical volume names" $lvm_pv_names >>$STORAGE_LVM_OUTPUT_FILE
+    # For each LVM physical volume output 'lvm pvdisplay':
+    for lvm_pv_name in $lvm_pv_names ; do
+        LogPrint "Saving 'lvm pvdisplay' output for $lvm_pv_name to $STORAGE_LVM_OUTPUT_FILE"
+        echo "### Output of lvm pvdisplay $lvm_pv_name (with $lvm_pv_name prefix added)" >>$STORAGE_LVM_OUTPUT_FILE
+        # For each LVM physical volume device save the details
+        # with the LVM physical volume device name as line prefix added (and discarded empty lines).
+        # Using # as sed 's' command delimiter because / is in $lvm_pv_name (like /dev/sdb2 or /dev/md125):
+        lvm pvdisplay --units B $lvm_pv_name | grep -v '^[[:space:]]*$' | sed -e "s#^#$lvm_pv_name #" >>$STORAGE_LVM_OUTPUT_FILE
+        pipe_exit_codes=( "${PIPESTATUS[@]}" )
+        pipe_commands=( "lvm pvdisplay --units B $lvm_pv_name" "grep -v '^[[:space:]]*$'" "sed -e 's#^#$lvm_pv_name #'" )
+        for pipe_command in pvdisplay grep sed ; do
+            case "$pipe_command" in
+                (pvdisplay)
+                    # Continue the foor loop with the next pipe_command when this one succeeded:
+                    test ${pipe_exit_codes[0]} -eq 0 && continue
+                    # Document in STORAGE_MDADM_OUTPUT_FILE that the 'mdadm' command had failed:
+                    echo "### Non zero exit code ${pipe_exit_codes[0]} from ${pipe_commands[0]}" >>$STORAGE_LVM_OUTPUT_FILE
+                    Error "Required command '${pipe_commands[0]}' failed with exit code ${pipe_exit_codes[0]}"
+                    ;;
+                (grep)
+                    # Continue the foor loop with the next pipe_command when this one succeeded:
+                    test ${pipe_exit_codes[1]} -eq 0 && continue
+                    Log "Command '... | ${pipe_commands[1]} | ...' failed with exit code ${pipe_exit_codes[1]}"
+                    ;;
+                (sed)
+                    # Break the foor loop when the last pipe_command succeeded:
+                    test ${pipe_exit_codes[2]} -eq 0 && break
+                    # Document in STORAGE_PARTED_OUTPUT_FILE that the 'sed' command had failed:
+                    echo "### Non zero exit code ${pipe_exit_codes[2]} from ... | ${pipe_commands[2]}" >>$STORAGE_LVM_OUTPUT_FILE
+                    Error "Required command '... | ${pipe_commands[2]}' failed with exit code ${pipe_exit_codes[2]}"
+                    ;;
+                (*)
+                    BugError "'for pipe_command in ...' loop run with invalid pipe_command value"
+                    ;;
+            esac
+        done
+
+
+    done
+
+
+else
+    # When there are 'lvm' TYPE entries in the 'lsblk' output
+    # there are LVM logical volumes so it is an error when there is no 'lvm' command:
+    grep -q 'TYPE="lvm"' $STORAGE_LSBLK_OUTPUT_FILE && Error "The 'lvm' command is required for saving storage info"
+    # Document that there is no 'lvm' command (also to overwrite possibly outdated STORAGE_LVM_OUTPUT_FILE content):
+    echo "# No 'lvm' output because there is no 'lvm' command dated $DATE (YYYYmmddHHMMSS)" >$STORAGE_LVM_OUTPUT_FILE
 fi
 
 
