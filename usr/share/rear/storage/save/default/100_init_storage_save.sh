@@ -8,6 +8,10 @@ local pipe_command
 
 LogPrint "Saving storage info (disks, partitions, filesystems, mountpoints, ...)"
 
+# Bash associative arrays are required for
+# recreating LVM volume groups:
+local -A associative_array && unset associative_array || Error "Bash associative arrays are required"
+
 Debug "Creating directories where to storage info gets saved (if not existing)"
 readonly STORAGE_SAVED_DIR="$VAR_DIR/storage/saved"
 mkdir -p $v "$STORAGE_SAVED_DIR"

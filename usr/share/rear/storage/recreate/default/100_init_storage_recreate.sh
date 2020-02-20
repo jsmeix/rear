@@ -14,6 +14,8 @@ LogPrint "Recreating storage according to the files in $STORAGE_SAVED_DIR"
 Debug "Creating directories for storage recreation (when not existing)"
 readonly STORAGE_RECREATING_DIR="$VAR_DIR/storage/recreating"
 mkdir -p $v "$STORAGE_RECREATING_DIR"
+readonly RECREATING_LVM_PVS_MAPPING_FILE="$STORAGE_RECREATING_DIR/lvm.PVs.old.new.mapping"
+readonly RECREATING_BLOCKDEV_SYMLINKS_FILE="$STORAGE_RECREATING_DIR/block_device.symlinks"
 readonly STORAGE_RECREATED_DIR="$VAR_DIR/storage/recreated"
 mkdir -p $v "$STORAGE_RECREATED_DIR"
 
@@ -87,7 +89,7 @@ local disk_kname partition_number partition_parted_line missing_partition
 local partition_start_byte partition_start_number partition_end_byte partition_end_number partition_filesystem_type gpt_partition_name
 local partition_flags partition_flag
 for disk_kname in $( grep 'TYPE="disk"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' KNAME="[^"]*"' | cut -d '"' -f2 ) ; do
-    LogPrint "Creating partitions on $disk_kname according to $STORAGE_PARTED_OUTPUT_FILE"
+    LogPrint "Creating partitions on $disk_kname according to $STORAGE_PARTED_OUTPUT_FILE ..."
     if ! grep -q "^$disk_kname " $STORAGE_PARTED_OUTPUT_FILE ; then
         LogPrintError "Cannot create partitions on $disk_kname (no info found in $STORAGE_PARTED_OUTPUT_FILE)"
         continue
@@ -183,7 +185,24 @@ for disk_kname in $( grep 'TYPE="disk"' $STORAGE_LSBLK_OUTPUT_FILE | grep -o ' K
             fi
         done
     done
+    LogPrint "Created partitions on $disk_kname"
 done
+# TODO: Verify that for all created partitions a matching kernel block device node exists.
+# Cf. the "Verify that the created RAID array device exists" comment below and see also
+# the comment for 'block_device_symlinks >$RECREATING_BLOCKDEV_SYMLINKS_FILE' below.
+# The problem is that we do not know for sure what the kernel block device node name
+# will be for partitions on whatever special kind of 'disk' type devices because
+# there are several different ways how kernel block device node names for partitions
+# are generated based on the kernel block device node name for its 'disk' device.
+# But we cannot call wait_for_device_node() when we do not know what to wait for.
+# Perhaps we could rely on what is stored in STORAGE_LSBLK_OUTPUT_FILE for 'part' type devices
+# from the original system where "rear mkrescue" had been running that the same must also
+# appear on the current (replacement) system where "rear recover" is currently running?
+# So for now we sleep 2 seconds and call "udevadm settle" and hope for the best
+# (in particular "udevadm settle" may silently wait up to its default timeout value of 120 seconds):
+LogPrint "Waiting for 'udevadm settle' to let the kernel block device nodes appear for the created partitions"
+sleep 2
+udevadm settle
 
 # Create MD devices aka Linux Software RAID:
 # For all listed 'ARRAY' device names (symlinks) in STORAGE_MDADM_OUTPUT_FILE
@@ -192,7 +211,7 @@ local raid_array_name
 local mdadm_detail_line extracted_value
 local raid_level raid_devices total_devices
 local component_devices component_device
-LogPrint "Creating MD devices (aka Linux Software RAID) according to $STORAGE_MDADM_OUTPUT_FILE"
+LogPrint "Creating MD devices (aka Linux Software RAID) according to $STORAGE_MDADM_OUTPUT_FILE ..."
 for raid_array_name in $( grep '^ARRAY ' $STORAGE_MDADM_OUTPUT_FILE | cut -d ' ' -f2 ) ; do
     LogPrint "Creating software RAID $raid_array_name"
     # Minimal 'mdadm' command to create a RAID array:
@@ -228,10 +247,10 @@ for raid_array_name in $( grep '^ARRAY ' $STORAGE_MDADM_OUTPUT_FILE | cut -d ' '
         BugError "Cannot create $raid_array_name (RAID devices $raid_devices != $total_devices total devices is currently not supported)"
         continue
     fi
-    # Verify that the RAID array devices exist:
+    # Verify that the RAID array component devices exist:
     for component_device in $component_devices ; do
         if ! wait_for_device_node $component_device ; then
-            LogPrintError "Cannot create RAID $raid_array_name (needed RAID device $component_device does not exist or did not appear)"
+            LogPrintError "Cannot create RAID $raid_array_name (needed RAID component device $component_device does not exist or did not appear)"
             continue 2
         fi
     done
@@ -246,7 +265,17 @@ for raid_array_name in $( grep '^ARRAY ' $STORAGE_MDADM_OUTPUT_FILE | cut -d ' '
          LogPrintError "Failed to create RAID $raid_array_name ('mdadm --create $raid_array_name --assume-clean --level=$raid_level --raid-devices=$raid_devices $component_devices' failed)"
         continue
     fi
+    # Verify that the created RAID array device exists.
+    # We do that here in particular because the created RAID array device is likely
+    # needed later to create a filesystem on it or as a LVM physical volume and
+    # here we know what device to wait for so we can call wait_for_device_node for it
+    # (cf. the comment for 'block_device_symlinks >$RECREATING_BLOCKDEV_SYMLINKS_FILE' below):
+    if ! wait_for_device_node $raid_array_name ; then
+        LogPrintError "Failed to create RAID $raid_array_name (RAID device $raid_array_name does not exist or did not appear)"
+        continue
+    fi
 done
+LogPrint "Created MD devices"
 
 # Create LVM physical volumes, LVM volume groups, and LVM logical volumes:
 local orig_pv_dev orig_pv_dev_symlink
@@ -257,23 +286,44 @@ local current_target
 local current_pv_dev
 local pv_uuid
 LogPrint "Creating LVM physical volumes, LVM volume groups, and LVM logical volumes according to $STORAGE_LVM_OUTPUT_FILE"
+
+# Creating LVM physical volumes:
+cat /dev/null >$RECREATING_LVM_PVS_MAPPING_FILE
+# TODO: Here is a problem with delays in udev or in the kernel (cf. https://github.com/rear/rear/issues/791)
+# when currently (some) block device symlinks may not yet be there (but may appear later after some time)
+# so subsequent things may fail because of not yet existing current block device symlinks.
+# But we cannot call wait_for_device_node() here because we do not know what to wait for.
+# In particular we cannot call wait_for_device_node() for the original block device symlinks or the
+# original block device nodes that existed on the original system where "rear mkrescue" had been running
+# because it is unknown which of those block device symlinks or block device nodes may also appear here
+# on the current (replacement) system where "rear recover" is currently running.
+# So for now we sleep 2 seconds and call "udevadm settle" before calling block_device_symlinks() and hope for the best
+# (in particular "udevadm settle" may silently wait up to its default timeout value of 120 seconds):
+LogPrint "Waiting for 'udevadm settle' to let block device nodes and block device symlinks appear that are needed for LVM"
+sleep 2
+udevadm settle
+block_device_symlinks >$RECREATING_BLOCKDEV_SYMLINKS_FILE
 for orig_pv_dev in $( grep '^LVM physical volume devices ' $STORAGE_LVM_OUTPUT_FILE | cut -d ' ' -f5- ) ; do
     # Determine what kernel device node to use for creating the LVM physical volume.
     # Because $orig_pv_dev is usually a kernel device node name like /dev/sdb2 or /dev/md123
     # and kernel device node names are not stable, cf. https://github.com/rear/rear/issues/2254
     # we need to find out what kernel device node on the current (replacement) system where "rear recover" is running
-    # match $orig_pv_dev that is the kernel device node on the original system where "rear mkrescue" was running.
+    # match $orig_pv_dev that is the kernel device node on the original system where "rear mkrescue" had been running.
     # To do that we get all original block device symlinks that had pointed to $orig_pv_dev on the original system and
     # try to find same current block device symlinks and use a current kernel device node where a symlink points to.
     # If there is a unique current kernel device node where all those symlinks point to we use that device node.
     # Otherwise we try some hopefully reasonable fallback behaviour what current kernel device node to use:
     current_pv_dev=""
     current_targets=()
+    # Get all original block device symlinks that had pointed to $orig_pv_dev on the original system:
     orig_pv_dev_symlinks=( $( grep "^$orig_pv_dev " $STORAGE_BLOCKDEV_SYMLINKS_FILE | cut -d ' ' -f2 ) )
+    # Try to find same current block device symlinks and get current kernel device nodes where a symlink points to:
     for orig_pv_dev_symlink in "${orig_pv_dev_symlinks[@]}" ; do
-        current_targets+=( $( block_device_symlinks | grep " $orig_pv_dev_symlink" | cut -d ' ' -f1 ) )
+        current_targets+=( $( grep " $orig_pv_dev_symlink" $RECREATING_BLOCKDEV_SYMLINKS_FILE | cut -d ' ' -f1 ) )
     done
+    # Remove duplicates in the current kernel device nodes where a current symlink points to:
     current_orig_pv_dev_symlinks_targets=( $( for current_target in "${current_targets[@]}" ; do echo $current_target ; done | sort -u ) )
+    # Fallback behaviour when no current symlink was found that also had exited on the original system:
     if ! test "${current_orig_pv_dev_symlinks_targets[*]}" ; then
         LogPrint "For LVM PV $orig_pv_dev no matching device symlink found (nothing like ${orig_pv_dev_symlinks[*]})"
         if test -b "$orig_pv_dev" ; then
@@ -284,10 +334,12 @@ for orig_pv_dev in $( grep '^LVM physical volume devices ' $STORAGE_LVM_OUTPUT_F
             continue
         fi
     fi
+    # If there is a unique current kernel device node where all those symlinks point to use that one:
     if test 1 -eq ${#current_orig_pv_dev_symlinks_targets[@]} ; then
         current_pv_dev=${current_orig_pv_dev_symlinks_targets[0]}
         LogPrint "Creating LVM PV for $orig_pv_dev using its current unique matching device $current_pv_dev"
     else
+        # Fallback behaviour when things are not unique:
         LogPrint "For LVM PV $orig_pv_dev found device symlinks that point to different targets ${current_orig_pv_dev_symlinks_targets[*]}"
         for current_pv_dev in "${current_orig_pv_dev_symlinks_targets[@]}" ; do
             if test "$current_pv_dev" = "$orig_pv_dev" ; then
@@ -300,6 +352,7 @@ for orig_pv_dev in $( grep '^LVM physical volume devices ' $STORAGE_LVM_OUTPUT_F
             LogPrint "Creating LVM PV for $orig_pv_dev using $current_pv_dev as fallback (first of the symlinks targets)"
         fi
     fi
+    # Final test to be on the safe side:
     if ! test -b "$current_pv_dev" ; then
         LogPrintError "Cannot create LVM PV for $orig_pv_dev (its current matching device '$current_pv_dev' is no block device)"
         continue
@@ -311,10 +364,72 @@ for orig_pv_dev in $( grep '^LVM physical volume devices ' $STORAGE_LVM_OUTPUT_F
         continue
     fi
     # Create the LVM physical volume:
-    if ! lvm pvcreate $verbose --force --yes --uuid "$pv_uuid" --norestorefile $current_pv_dev ; then
-        LogPrintError "Failed to create LVM PV ('lvm pvcreate --force --yes --uuid $pv_uuid --norestorefile $current_pv_dev' failed)"
+    # Using '-ff' is mandatory because with only a single '-f' it sometimes fails with the message
+    #   Can't initialize physical volume "/dev/somePVdev" of volume group "someVG" without -ff
+    # but (of course) without a reason why it fails so we play dumb and just do what they ask for:
+    if lvm pvcreate $verbose -ff --yes --uuid "$pv_uuid" --norestorefile $current_pv_dev ; then
+        # Only for successfully created LVM physical volumes remember their
+        # orig_pv_dev current_pv_dev mapping (needed when creating LVM volume groups):
+        echo "$orig_pv_dev $current_pv_dev" >>$RECREATING_LVM_PVS_MAPPING_FILE
+    else
+        LogPrintError "Failed to create LVM PV ('lvm pvcreate -ff --yes --uuid $pv_uuid --norestorefile $current_pv_dev' failed)"
     fi
 done
+
+# Creating LVM volume groups:
+# Here we need an associative array to avoid awkward coding workarounds.
+# The volume_groups associative array elemets have the following form:
+#   keyword is the VG name
+#   value is a string of PVs that belong to the VG in the keyword
+# VG and LV names cannot contain spaces because according to "man lvm"
+#   "The valid characters for VG and LV names are: a-z A-Z 0-9 + _ . -"
+# PVs are device nodes or symlinks in /dev/ which also do not contain spaces.
+# Therefore VG names and PVs are single words so that we can store
+# more of them as a string:
+local -A volume_groups || Error "Bash associative arrays are required"
+local vg_name vg_current_pv_devs
+for orig_pv_dev in $( grep '^LVM physical volume devices ' $STORAGE_LVM_OUTPUT_FILE | cut -d ' ' -f5- ) ; do
+    vg_name="$( grep "^$orig_pv_dev *VG Name " $STORAGE_LVM_OUTPUT_FILE | tr -s '[:blank:]' ' ' |  cut -d ' ' -f4 )"
+    if ! test "$vg_name" ; then
+        LogPrintError "Cannot attach LVM PV $orig_pv_dev to a VG (no matching 'VG Name' found in $STORAGE_LVM_OUTPUT_FILE)"
+        continue
+    fi
+    # RECREATING_LVM_PVS_MAPPING_FILE contains "old new" mapping lines of the form "orig_pv_dev current_pv_dev":
+    current_pv_dev="$( grep "^$orig_pv_dev " $RECREATING_LVM_PVS_MAPPING_FILE |  cut -d ' ' -f2 )"
+    if ! test -b $current_pv_dev ; then
+        # It also fails here intentinally when creating the PV for orig_pv_dev had failed above:
+        LogPrintError "Cannot attach LVM PV for $orig_pv_dev to VG $vg_name (its current PV '$current_pv_dev' is no block device or empty)"
+        continue
+    fi
+    volume_groups["$vg_name"]+="$current_pv_dev "
+done
+# Create the LVM volume groups:
+for vg_name in "${!volume_groups[@]}" ; do
+    vg_current_pv_devs="${volume_groups[$vg_name]}"
+    if ! test "$vg_current_pv_devs" ; then
+        LogPrintError "Cannot create LVM VG $vg_name (found no current PVs for it)"
+        continue
+    fi
+    # Because under certain circumstances it had happened that 'vgcreate' failed
+    # and reported that the VG that is to be creted already exists.
+    # So to be more on the safe side we run 'vgremove' before:
+    if lvm vgremove $verbose -ff --yes $vg_name ; then
+        Log "Unexpectedly 'vgremove' did not fail here because normally $vg_name should not yet exist"
+    else
+        Log "It is normal that 'vgremove' fails because $vg_name should not yet exist (it is only run as precaution)"
+    fi
+    # Actually create the VG:
+    if lvm vgcreate $verbose -ff --yes $vg_name $vg_current_pv_devs ; then
+        LogPrintError "Created LVM VG $vg_name with those PVs: $vg_current_pv_devs"
+    else
+        LogPrintError "Failed to create LVM VG ('lvm vgcreate -ff --yes $vg_name $vg_current_pv_devs' failed)"
+        continue
+    fi
+done
+
+# Creating LVM logical volumes:
+
+LogPrint "Created LVM physical volumes, LVM volume groups, and LVM logical volumes"
 
 
 unset -f wait_for_device_node
