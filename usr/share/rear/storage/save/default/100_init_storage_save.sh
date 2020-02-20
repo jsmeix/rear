@@ -211,7 +211,7 @@ if has_binary lvm ; then
     echo "##### Output of lvm pvs -o pv_name --rows --noheadings (with 'LVM physical volume names' prefix added)" >>$STORAGE_LVM_OUTPUT_FILE
     # Having $lvm_pv_names outside of the "..." (as separated arguments) removes its two leading space characters in the 'echo' output
     # ('help echo' reads: "Display the ARGs, separated by a single space character" so "echo  foo  bar " outputs 'foo bar'):
-    echo "LVM physical volume names" $lvm_pv_names >>$STORAGE_LVM_OUTPUT_FILE
+    echo "LVM physical volume devices" $lvm_pv_names >>$STORAGE_LVM_OUTPUT_FILE
     # For each LVM physical volume output 'lvm pvdisplay':
     for lvm_pv_name in $lvm_pv_names ; do
         LogPrint "Saving 'lvm pvdisplay' output for $lvm_pv_name to $STORAGE_LVM_OUTPUT_FILE"

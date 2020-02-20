@@ -46,9 +46,24 @@ function wait_for_device_node () {
     return 1
 }
 
+# Output symlinks in /dev/ that point to kernel block device node names.
+# Each symlink is on a separated line that has the form
+#    /dev/kernel_block_device_node /dev/symlink_path_that_points_to_kernel_block_device_node
+# and the lines are sorted (so same kernel block device nodes appear next to each other):
+function block_device_symlinks () {
+    { local symlink symlink_target
+      for symlink in $( find /dev -type l ) ; do
+          symlink_target=$( readlink -e $symlink )
+          test -b "$symlink_target" || continue
+          echo "$symlink_target $symlink"
+      done | sort
+    } 2>>/dev/$DISPENSABLE_OUTPUT_DEV
+}
+
 # When there are TYPE="raid.*" devices in STORAGE_LSBLK_OUTPUT_FILE
 # shut down all MD devices aka Linux Software RAID arrays that can be shut down (i.e. that are not currently in use):
 if grep -q 'TYPE="raid.*"' $STORAGE_LSBLK_OUTPUT_FILE ; then
+    LogPrint "Shutting down MD devices aka software RAID arrays ('lsblk' shows TYPE 'raid.*' devices)"
     mdadm --stop --scan || LogPrintError "Cannot shut down software RAID arrays ('mdadm --stop --scan' failed)"
 fi
 
@@ -61,7 +76,8 @@ fi
 local type kname
 for type in part disk ; do
     for kname in $( lsblk -ipo TYPE,KNAME | grep "^$type " | tac | tr -s '[:blank:]' ' ' |  cut -d ' ' -f2 ) ; do
-        wipefs -a -f $kname && LogPrint "Wiped $kname by 'wipefs -a -f'" || LogPrintError "Failed to wipe $kname by 'wipefs -a -f'"
+        LogPrint "Wiping $kname by 'wipefs -a -f'"
+        wipefs -a -f $kname || LogPrintError "Failed to wipe $kname by 'wipefs -a -f'"
     done
 done
 
@@ -175,18 +191,18 @@ done
 local raid_array_name
 local mdadm_detail_line extracted_value
 local raid_level raid_devices total_devices
-local raid_block_device_nodes raid_block_device_node
+local component_devices component_device
 LogPrint "Creating MD devices (aka Linux Software RAID) according to $STORAGE_MDADM_OUTPUT_FILE"
 for raid_array_name in $( grep '^ARRAY ' $STORAGE_MDADM_OUTPUT_FILE | cut -d ' ' -f2 ) ; do
     LogPrint "Creating software RAID $raid_array_name"
     # Minimal 'mdadm' command to create a RAID array:
-    #   mdadm --create $raid_array_name --level=$raid_level --raid-devices=$raid_devices $raid_block_device_nodes
+    #   mdadm --create $raid_array_name --level=$raid_level --raid-devices=$raid_devices $component_devices
     # for example
     #   mdadm --create MyArray --level=raid1 --raid-devices=2 /dev/sda2 /dev/sdb2
     raid_level=""
     raid_devices=""
     total_devices=""
-    raid_block_device_nodes=""
+    component_devices=""
     while read mdadm_detail_line ; do
         # Example 'Raid Level' line:
         #          Raid Level : raid1
@@ -205,7 +221,7 @@ for raid_array_name in $( grep '^ARRAY ' $STORAGE_MDADM_OUTPUT_FILE | cut -d ' '
         #      Number   Major   Minor   RaidDevice State
         #         0       8        2        0      active sync   /dev/sda2
         #         1       8       18        1      active sync   /dev/sdb2
-        extracted_value="$( set -o pipefail ; grep -o ' /dev/.*' <<<"$mdadm_detail_line" | tr -d '[:space:]' )" && raid_block_device_nodes+=" $extracted_value"
+        extracted_value="$( set -o pipefail ; grep -o ' /dev/.*' <<<"$mdadm_detail_line" | tr -d '[:space:]' )" && component_devices+=" $extracted_value"
     done < <( grep "^$raid_array_name " $STORAGE_MDADM_OUTPUT_FILE | sed -e "s#^$raid_array_name ##" )
     # Check RAID devices number:
     if ! test $raid_devices -eq $total_devices ; then
@@ -213,30 +229,91 @@ for raid_array_name in $( grep '^ARRAY ' $STORAGE_MDADM_OUTPUT_FILE | cut -d ' '
         continue
     fi
     # Verify that the RAID array devices exist:
-    for raid_block_device_node in $raid_block_device_nodes ; do
-        if ! wait_for_device_node $raid_block_device_node ; then
-            LogPrintError "Cannot create RAID $raid_array_name (needed RAID device $raid_block_device_node does not exist or did not appear)"
+    for component_device in $component_devices ; do
+        if ! wait_for_device_node $component_device ; then
+            LogPrintError "Cannot create RAID $raid_array_name (needed RAID device $component_device does not exist or did not appear)"
             continue 2
         fi
     done
     # Create the RAID array.
     # There is no 'mdadm' option to enforce non-interactive mode so we feed 'y' into it to respond positively to all its questions
     # (there is no 'yes' program like /usr/bin/yes in the ReaR recovery system so we feed an unlimited amount of 'y' manually).
-    # The while loop ends with exit code 141 which means 141 - 128 = 13 = SIGPIPE when 'mdadm' finishes
-    # and the exit code of the pipe is the exit code of its last command so we test the 'mdadm' exit code:
-    if ! while true ; do echo 'y' ; done | mdadm --create $raid_array_name --level=$raid_level --raid-devices=$raid_devices $raid_block_device_nodes ; then
-         LogPrintError "Failed to create RAID $raid_array_name ('mdadm --create $raid_array_name --level=$raid_level --raid-devices=$raid_devices $raid_block_device_nodes' failed)"
+    # Without "sleep 1" tens of thousands of '++ true' and '++ echo y' lines would appear in the log in 'set -x' debugscript mode
+    # which also indicates that 'mdadm' is needlessly greedy and swallows unlimited amounts of whatever it gets fed via stdin.
+    # The while loop dies with exit code 141 which means 141 - 128 = 13 = SIGPIPE when 'mdadm' finishes.
+    # The exit code of the pipe is the exit code of its last command so we test the 'mdadm' exit code:
+    if ! while true ; do echo 'y' ; sleep 1 ; done | mdadm --create $raid_array_name $verbose --assume-clean --level=$raid_level --raid-devices=$raid_devices $component_devices ; then
+         LogPrintError "Failed to create RAID $raid_array_name ('mdadm --create $raid_array_name --assume-clean --level=$raid_level --raid-devices=$raid_devices $component_devices' failed)"
         continue
     fi
 done
 
 # Create LVM physical volumes, LVM volume groups, and LVM logical volumes:
-local lvm_pv_name
+local orig_pv_dev orig_pv_dev_symlink
+local orig_pv_dev_symlinks=()
+local current_targets=()
+local current_orig_pv_dev_symlinks_targets=()
+local current_target
+local current_pv_dev
+local pv_uuid
 LogPrint "Creating LVM physical volumes, LVM volume groups, and LVM logical volumes according to $STORAGE_LVM_OUTPUT_FILE"
-for lvm_pv_name in $( grep '^LVM physical volume names ' $STORAGE_LVM_OUTPUT_FILE | cut -d ' ' -f5- ) ; do
-    LogPrint "Creating LVM physical volume $lvm_pv_name"
-
-
+for orig_pv_dev in $( grep '^LVM physical volume devices ' $STORAGE_LVM_OUTPUT_FILE | cut -d ' ' -f5- ) ; do
+    # Determine what kernel device node to use for creating the LVM physical volume.
+    # Because $orig_pv_dev is usually a kernel device node name like /dev/sdb2 or /dev/md123
+    # and kernel device node names are not stable, cf. https://github.com/rear/rear/issues/2254
+    # we need to find out what kernel device node on the current (replacement) system where "rear recover" is running
+    # match $orig_pv_dev that is the kernel device node on the original system where "rear mkrescue" was running.
+    # To do that we get all original block device symlinks that had pointed to $orig_pv_dev on the original system and
+    # try to find same current block device symlinks and use a current kernel device node where a symlink points to.
+    # If there is a unique current kernel device node where all those symlinks point to we use that device node.
+    # Otherwise we try some hopefully reasonable fallback behaviour what current kernel device node to use:
+    current_pv_dev=""
+    current_targets=()
+    orig_pv_dev_symlinks=( $( grep "^$orig_pv_dev " $STORAGE_BLOCKDEV_SYMLINKS_FILE | cut -d ' ' -f2 ) )
+    for orig_pv_dev_symlink in "${orig_pv_dev_symlinks[@]}" ; do
+        current_targets+=( $( block_device_symlinks | grep " $orig_pv_dev_symlink" | cut -d ' ' -f1 ) )
+    done
+    current_orig_pv_dev_symlinks_targets=( $( for current_target in "${current_targets[@]}" ; do echo $current_target ; done | sort -u ) )
+    if ! test "${current_orig_pv_dev_symlinks_targets[*]}" ; then
+        LogPrint "For LVM PV $orig_pv_dev no matching device symlink found (nothing like ${orig_pv_dev_symlinks[*]})"
+        if test -b "$orig_pv_dev" ; then
+            LogPrint "Creating LVM PV using its original device $orig_pv_dev as last resort"
+            current_pv_dev=$orig_pv_dev
+        else
+            LogPrintError "Cannot create LVM PV for $orig_pv_dev (no matching kernel block device found)"
+            continue
+        fi
+    fi
+    if test 1 -eq ${#current_orig_pv_dev_symlinks_targets[@]} ; then
+        current_pv_dev=${current_orig_pv_dev_symlinks_targets[0]}
+        LogPrint "Creating LVM PV for $orig_pv_dev using its current unique matching device $current_pv_dev"
+    else
+        LogPrint "For LVM PV $orig_pv_dev found device symlinks that point to different targets ${current_orig_pv_dev_symlinks_targets[*]}"
+        for current_pv_dev in "${current_orig_pv_dev_symlinks_targets[@]}" ; do
+            if test "$current_pv_dev" = "$orig_pv_dev" ; then
+                LogPrint "Creating LVM PV by using $current_pv_dev that is same as the original device as best guess"
+                break
+            fi
+        done
+        if ! test "$current_pv_dev" = "$orig_pv_dev" ; then
+            current_pv_dev=${current_orig_pv_dev_symlinks_targets[0]}
+            LogPrint "Creating LVM PV for $orig_pv_dev using $current_pv_dev as fallback (first of the symlinks targets)"
+        fi
+    fi
+    if ! test -b "$current_pv_dev" ; then
+        LogPrintError "Cannot create LVM PV for $orig_pv_dev (its current matching device '$current_pv_dev' is no block device)"
+        continue
+    fi
+    # Get the UUID:
+    pv_uuid="$( grep "^$orig_pv_dev *PV UUID " $STORAGE_LVM_OUTPUT_FILE | tr -s '[:blank:]' ' ' |  cut -d ' ' -f4 )"
+    if ! test "$pv_uuid" ; then
+        LogPrintError "Cannot create LVM PV for $orig_pv_dev (no matching 'PV UUID' found in $STORAGE_LVM_OUTPUT_FILE)"
+        continue
+    fi
+    # Create the LVM physical volume:
+    if ! lvm pvcreate $verbose --force --yes --uuid "$pv_uuid" --norestorefile $current_pv_dev ; then
+        LogPrintError "Failed to create LVM PV ('lvm pvcreate --force --yes --uuid $pv_uuid --norestorefile $current_pv_dev' failed)"
+    fi
 done
 
 
