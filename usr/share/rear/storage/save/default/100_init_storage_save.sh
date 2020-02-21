@@ -167,7 +167,7 @@ if has_binary mdadm ; then
                 (sed)
                     # Break the foor loop when the last pipe_command succeeded:
                     test ${pipe_exit_codes[2]} -eq 0 && break
-                    # Document in STORAGE_PARTED_OUTPUT_FILE that the 'sed' command had failed:
+                    # Document in STORAGE_MDADM_OUTPUT_FILE that the 'sed' command had failed:
                     echo "### Non zero exit code ${pipe_exit_codes[2]} from ... | ${pipe_commands[2]}" >>$STORAGE_MDADM_OUTPUT_FILE
                     Error "Required command '... | ${pipe_commands[2]}' failed with exit code ${pipe_exit_codes[2]}"
                     ;;
@@ -218,7 +218,7 @@ if has_binary lvm ; then
     echo "LVM physical volume devices" $lvm_pv_names >>$STORAGE_LVM_OUTPUT_FILE
     # For each LVM physical volume output 'lvm pvdisplay':
     for lvm_pv_name in $lvm_pv_names ; do
-        LogPrint "Saving 'lvm pvdisplay' output for $lvm_pv_name to $STORAGE_LVM_OUTPUT_FILE"
+        LogPrint "Saving 'lvm pvdisplay' output for LVM PV $lvm_pv_name to $STORAGE_LVM_OUTPUT_FILE"
         echo "### Output of lvm pvdisplay $lvm_pv_name (with $lvm_pv_name prefix added)" >>$STORAGE_LVM_OUTPUT_FILE
         # For each LVM physical volume device save the details
         # with the LVM physical volume device name as line prefix added (and discarded empty lines).
@@ -231,7 +231,7 @@ if has_binary lvm ; then
                 (pvdisplay)
                     # Continue the foor loop with the next pipe_command when this one succeeded:
                     test ${pipe_exit_codes[0]} -eq 0 && continue
-                    # Document in STORAGE_MDADM_OUTPUT_FILE that the 'mdadm' command had failed:
+                    # Document in STORAGE_LVM_OUTPUT_FILE that the 'pvdisplay' command had failed:
                     echo "### Non zero exit code ${pipe_exit_codes[0]} from ${pipe_commands[0]}" >>$STORAGE_LVM_OUTPUT_FILE
                     Error "Required command '${pipe_commands[0]}' failed with exit code ${pipe_exit_codes[0]}"
                     ;;
@@ -243,7 +243,7 @@ if has_binary lvm ; then
                 (sed)
                     # Break the foor loop when the last pipe_command succeeded:
                     test ${pipe_exit_codes[2]} -eq 0 && break
-                    # Document in STORAGE_PARTED_OUTPUT_FILE that the 'sed' command had failed:
+                    # Document in STORAGE_LVM_OUTPUT_FILE that the 'sed' command had failed:
                     echo "### Non zero exit code ${pipe_exit_codes[2]} from ... | ${pipe_commands[2]}" >>$STORAGE_LVM_OUTPUT_FILE
                     Error "Required command '... | ${pipe_commands[2]}' failed with exit code ${pipe_exit_codes[2]}"
                     ;;
@@ -252,11 +252,53 @@ if has_binary lvm ; then
                     ;;
             esac
         done
-
-
     done
-
-
+    # Output for LVM volume groups and logical volumes:
+    local lvm_vg_names lvm_vg_name
+    # Usually the 'lvm vgs -o vg_name --rows --noheadings' output looks like
+    #   vg_name_1 vg_name_2 vg_name_3
+    # (with two leading space characters):
+    lvm_vg_names="$( lvm vgs -o vg_name --rows --noheadings )" || Error "Required command 'lvm vgs -o vg_name --rows --noheadings' failed with exit code $?"
+    echo "##### Output of lvm vgs -o vg_name --rows --noheadings (with 'LVM volume group names' prefix added)" >>$STORAGE_LVM_OUTPUT_FILE
+    # Having $lvm_vg_names outside of the "..." (as separated arguments) removes its two leading space characters in the 'echo' output
+    # ('help echo' reads: "Display the ARGs, separated by a single space character" so "echo  foo  bar " outputs 'foo bar'):
+    echo "LVM volume group names" $lvm_vg_names >>$STORAGE_LVM_OUTPUT_FILE
+    # For each LVM volume group output 'lvm lvdisplay':
+    for lvm_vg_name in $lvm_vg_names ; do
+        LogPrint "Saving 'lvm lvdisplay' output for LVM VG $lvm_vg_name to $STORAGE_LVM_OUTPUT_FILE"
+        echo "### Output of lvm lvdisplay $lvm_vg_name (with $lvm_vg_name prefix added)" >>$STORAGE_LVM_OUTPUT_FILE
+        # For each LVM logical volume save the details
+        # with the LVM volume group name as line prefix added (and discarded empty lines):
+        lvm lvdisplay --units B $lvm_vg_name | grep -v '^[[:space:]]*$' | sed -e "s/^/$lvm_vg_name /" >>$STORAGE_LVM_OUTPUT_FILE
+        pipe_exit_codes=( "${PIPESTATUS[@]}" )
+        pipe_commands=( "lvm lvdisplay --units B $lvm_vg_name" "grep -v '^[[:space:]]*$'" "sed -e 's/^/$lvm_vg_name /'" )
+        for pipe_command in lvdisplay grep sed ; do
+            case "$pipe_command" in
+                (lvdisplay)
+                    # Continue the foor loop with the next pipe_command when this one succeeded:
+                    test ${pipe_exit_codes[0]} -eq 0 && continue
+                    # Document in STORAGE_LVM_OUTPUT_FILE that the 'lvdisplay' command had failed:
+                    echo "### Non zero exit code ${pipe_exit_codes[0]} from ${pipe_commands[0]}" >>$STORAGE_LVM_OUTPUT_FILE
+                    Error "Required command '${pipe_commands[0]}' failed with exit code ${pipe_exit_codes[0]}"
+                    ;;
+                (grep)
+                    # Continue the foor loop with the next pipe_command when this one succeeded:
+                    test ${pipe_exit_codes[1]} -eq 0 && continue
+                    Log "Command '... | ${pipe_commands[1]} | ...' failed with exit code ${pipe_exit_codes[1]}"
+                    ;;
+                (sed)
+                    # Break the foor loop when the last pipe_command succeeded:
+                    test ${pipe_exit_codes[2]} -eq 0 && break
+                    # Document in STORAGE_LVM_OUTPUT_FILE that the 'sed' command had failed:
+                    echo "### Non zero exit code ${pipe_exit_codes[2]} from ... | ${pipe_commands[2]}" >>$STORAGE_LVM_OUTPUT_FILE
+                    Error "Required command '... | ${pipe_commands[2]}' failed with exit code ${pipe_exit_codes[2]}"
+                    ;;
+                (*)
+                    BugError "'for pipe_command in ...' loop run with invalid pipe_command value"
+                    ;;
+            esac
+        done
+    done
 else
     # When there are 'lvm' TYPE entries in the 'lsblk' output
     # there are LVM logical volumes so it is an error when there is no 'lvm' command:
