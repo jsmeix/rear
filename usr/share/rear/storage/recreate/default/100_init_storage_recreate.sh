@@ -211,9 +211,9 @@ local raid_array_name
 local mdadm_detail_line extracted_value
 local raid_level raid_devices total_devices
 local component_devices component_device
+local mdadm_assume_clean
 LogPrint "Creating MD devices (aka Linux Software RAID) according to $STORAGE_MDADM_OUTPUT_FILE ..."
 for raid_array_name in $( grep '^ARRAY ' $STORAGE_MDADM_OUTPUT_FILE | cut -d ' ' -f2 ) ; do
-    LogPrint "Creating software RAID $raid_array_name"
     # Minimal 'mdadm' command to create a RAID array:
     #   mdadm --create $raid_array_name --level=$raid_level --raid-devices=$raid_devices $component_devices
     # for example
@@ -240,8 +240,14 @@ for raid_array_name in $( grep '^ARRAY ' $STORAGE_MDADM_OUTPUT_FILE | cut -d ' '
         #      Number   Major   Minor   RaidDevice State
         #         0       8        2        0      active sync   /dev/sda2
         #         1       8       18        1      active sync   /dev/sdb2
-        extracted_value="$( set -o pipefail ; grep -o ' /dev/.*' <<<"$mdadm_detail_line" | tr -d '[:space:]' )" && component_devices+=" $extracted_value"
+        extracted_value="$( set -o pipefail ; grep -o ' /dev/.*' <<<"$mdadm_detail_line" | tr -d '[:space:]' )" && component_devices+="$extracted_value "
     done < <( grep "^$raid_array_name " $STORAGE_MDADM_OUTPUT_FILE | sed -e "s#^$raid_array_name ##" )
+    # Check that Raid Level exists:
+    if ! test "$raid_level" ; then
+        BugError "Cannot create $raid_array_name (no matching 'Raid Level' found in $STORAGE_MDADM_OUTPUT_FILE)"
+        continue
+    fi
+    LogPrint "Creating software RAID $raid_array_name ($raid_level) from $component_devices"
     # Check RAID devices number:
     if ! test $raid_devices -eq $total_devices ; then
         BugError "Cannot create $raid_array_name (RAID devices $raid_devices != $total_devices total devices is currently not supported)"
@@ -254,6 +260,9 @@ for raid_array_name in $( grep '^ARRAY ' $STORAGE_MDADM_OUTPUT_FILE | cut -d ' '
             continue 2
         fi
     done
+    # No initial resync when creating RAID1 arrays to avoid higher system load and delays for some time while the initial resync is done:
+    mdadm_assume_clean=""
+    test "raid1" = "$raid_level" && mdadm_assume_clean="--assume-clean"
     # Create the RAID array.
     # There is no 'mdadm' option to enforce non-interactive mode so we feed 'y' into it to respond positively to all its questions
     # (there is no 'yes' program like /usr/bin/yes in the ReaR recovery system so we feed an unlimited amount of 'y' manually).
@@ -261,8 +270,8 @@ for raid_array_name in $( grep '^ARRAY ' $STORAGE_MDADM_OUTPUT_FILE | cut -d ' '
     # which also indicates that 'mdadm' is needlessly greedy and swallows unlimited amounts of whatever it gets fed via stdin.
     # The while loop dies with exit code 141 which means 141 - 128 = 13 = SIGPIPE when 'mdadm' finishes.
     # The exit code of the pipe is the exit code of its last command so we test the 'mdadm' exit code:
-    if ! while true ; do echo 'y' ; sleep 1 ; done | mdadm --create $raid_array_name $verbose --assume-clean --level=$raid_level --raid-devices=$raid_devices $component_devices ; then
-         LogPrintError "Failed to create RAID $raid_array_name ('mdadm --create $raid_array_name --assume-clean --level=$raid_level --raid-devices=$raid_devices $component_devices' failed)"
+    if ! while true ; do echo 'y' ; sleep 1 ; done | mdadm --create $raid_array_name $verbose --level=$raid_level --raid-devices=$raid_devices $mdadm_assume_clean $component_devices ; then
+         LogPrintError "Failed to create RAID $raid_array_name ('mdadm --create $raid_array_name --level=$raid_level --raid-devices=$raid_devices $mdadm_assume_clean $component_devices' failed)"
         continue
     fi
     # Verify that the created RAID array device exists.
@@ -278,6 +287,10 @@ done
 LogPrint "Created MD devices"
 
 # Create LVM physical volumes, LVM volume groups, and LVM logical volumes:
+local old_lvs=()
+local old_vgs=()
+local old_pvs=()
+local old_lv old_vg old_pv
 local orig_pv_dev orig_pv_dev_symlink
 local orig_pv_dev_symlinks=()
 local current_targets=()
@@ -286,6 +299,87 @@ local current_target
 local current_pv_dev
 local pv_uuid
 LogPrint "Creating LVM physical volumes, LVM volume groups, and LVM logical volumes according to $STORAGE_LVM_OUTPUT_FILE"
+# Under certain circumstances LVM setup can fail in arbitrary weird ways.
+# This happens probably only when "rear recover" is run on an already used disk
+# so that the exact same storage objects (partitions, MD software RAID arrays, LVM PVs VGs LVs, ...)
+# get recreated again with exact same byte locations on the disk so that previous storage objects
+# are still there on the disk and re-appear (in particular LVM storage objects) regardless that
+# all disk partitions and disks were wiped with 'wipefs' above.
+# Perhaps this happens only when LVM PVs are MD software RAID arrays because those cannot wiped with 'wipefs'
+# (because running 'wipefs' on a new created MD software RAID array would destroy the RAID array metadata).
+# For example when it happened 'pvcreate' for three PVs had failed with the following messsages:
+#   ++ lvm pvcreate --verbose -ff --yes --uuid UujOGu-HnoZ-wkb3-xYrP-qlPA-fsIW-vFwgWP --norestorefile /dev/md125
+#   Creating directory "/run/lock/lvm"
+#   Wiping internal VG cache
+#   Wiping cache of LVM-capable devices
+#   WARNING: PV /dev/md127 is marked in use but no VG was found using it.
+#   WARNING: PV /dev/md127 might need repairing.
+#   Wiping signatures on new PV /dev/md125.
+#   Set up physical volume for "/dev/md125" with 12572672 available sectors.
+#   Zeroing start of device /dev/md125.
+#   Writing physical volume data to disk "/dev/md125".
+#   Physical volume "/dev/md125" successfully created.
+#   ++ lvm pvcreate --verbose -ff --yes --uuid teha2M-H08h-0HyM-9T3N-zzKz-lAS5-nfPI0s --norestorefile /dev/md126
+#   Wiping internal VG cache
+#   Wiping cache of LVM-capable devices
+#   WARNING: Inconsistent metadata found for VG vg15gib - updating to use version 1
+#   WARNING: Repairing Physical Volume /dev/md125 that is in Volume Group vg15gib but not marked as used.
+#   WARNING: Inconsistent metadata found for VG vg15gib - updating to use version 2
+#   WARNING: PV /dev/md127 is marked in use but no VG was found using it.
+#   WARNING: PV /dev/md127 might need repairing.
+#   Wiping signatures on new PV /dev/md126.
+#   Set up physical volume for "/dev/md126" with 8378368 available sectors.
+#   Zeroing start of device /dev/md126.
+#   Writing physical volume data to disk "/dev/md126".
+#   Physical volume "/dev/md126" successfully created.
+#   ++ lvm pvcreate --verbose -ff --yes --uuid ybWr5m-bpO0-PJqn-tivT-BnyQ-RJy2-WTSXBf --norestorefile /dev/md127
+#   Wiping internal VG cache
+#   Wiping cache of LVM-capable devices
+#   WARNING: Inconsistent metadata found for VG vg15gib - updating to use version 3
+#   WARNING: Repairing Physical Volume /dev/md126 that is in Volume Group vg15gib but not marked as used.
+#   WARNING: Inconsistent metadata found for VG vg15gib - updating to use version 4
+#   WARNING: PV /dev/md127 is marked in use but no VG was found using it.
+#   WARNING: PV /dev/md127 might need repairing.
+#   UUID ybWr5m-bpO0-PJqn-tivT-BnyQ-RJy2-WTSXBf already in use on "/dev/md127".
+#   ++ LogPrintError "Failed to create LVM PV ('lvm pvcreate -ff --yes --uuid ybWr5m-bpO0-PJqn-tivT-BnyQ-RJy2-WTSXBf --norestorefile /dev/md127' failed)"
+# So for each subsequent 'pvcreate' call things go more and more wrong unitl the third 'pvcreate' call failed.
+# In particlular the messages about "VG vg15gib" at this point here where no VG was created (this happens below)
+# show that a "VG vg15gib" already exists which indicates that the existing "VG vg15gib" is old LVM metadata on the disk.
+# According to https://www.linuxquestions.org/questions/linux-hardware-18/remove-lvm2-metadat-from-disk-917503/
+#   "The safest way to clear the LVM metadata is
+#    vgchange -an vgname
+#    lvremove lvname(s)
+#    vgremove vgname
+#    pvremove pvname(s)"
+# Accordingly we remove old LVM remainders that may exist on the current system where "rear recover" is currently running:
+old_lvs=( $( lvm lvs --noheadings | tr -s '[:blank:]' ' ' |  cut -d ' ' -f2 ) )
+test "$old_lvs" && LogPrint "Found old LVM remainder LVs that will be removed ${old_lvs[*]}"
+old_vgs=( $( lvm vgs --noheadings | tr -s '[:blank:]' ' ' |  cut -d ' ' -f2 ) )
+test "$old_vgs" && LogPrint "Found old LVM remainder VGs that will be removed ${old_vgs[*]}"
+old_pvs=( $( lvm pvs --noheadings | tr -s '[:blank:]' ' ' |  cut -d ' ' -f2 ) )
+test "$old_pvs" && LogPrint "Found old LVM remainder PVs that will be removed ${old_pvs[*]}"
+# Deactivate old remainder VGs:
+for old_vg in "${old_vgs[@]}" ; do
+    Log "Deactivating old LVM remainder VG $old_vg"
+    if ! lvm vgchange $verbose -ff --yes --activate n $old_vg ; then
+        LogPrintError "Cannot deactivate old LVM remainder VG $old_vg ('lvm vgchange -ff --yes --activate n $old_vg' failed)"
+    fi
+done
+# Remove old remainder LVs:
+for old_lv in "${old_lvs[@]}" ; do
+    LogPrint "Removing old LVM remainder LV $old_lv"
+    lvm lvremove $verbose -ff --yes $old_lv || LogPrintError "Cannot remove old LVM remainder LV $old_lv ('lvm lvremove -ff --yes $old_lv' failed)"
+done
+# Remove old remainder VGs:
+for old_vg in "${old_vgs[@]}" ; do
+    Log "Removing old LVM remainder VG $old_vg"
+    lvm vgremove $verbose -ff --yes $old_vg || LogPrintError "Cannot remove old LVM remainder VG $old_vg ('lvm vgremove -ff --yes $old_vg' failed)"
+done
+# Remove old remainder PVs:
+for old_pv in "${old_pvs[@]}" ; do
+    Log "Removing old LVM remainder PV $old_pv"
+    lvm pvremove $verbose -ff --yes $old_pv || LogPrintError "Cannot remove old LVM remainder PV $old_pv ('lvm pvremove -ff --yes $old_pv' failed)"
+done
 
 # Creating LVM physical volumes:
 cat /dev/null >$RECREATING_LVM_PVS_MAPPING_FILE
@@ -363,10 +457,10 @@ for orig_pv_dev in $( grep '^LVM physical volume devices ' $STORAGE_LVM_OUTPUT_F
         LogPrintError "Cannot create LVM PV for $orig_pv_dev (no matching 'PV UUID' found in $STORAGE_LVM_OUTPUT_FILE)"
         continue
     fi
-    # Create the LVM physical volume:
-    # Using '-ff' is mandatory because with only a single '-f' it sometimes fails with the message
+    # Actually create the PV:
+    # Using '-ff' seems to be mandatory because with a single '-f' it had sometimes failed with the message
     #   Can't initialize physical volume "/dev/somePVdev" of volume group "someVG" without -ff
-    # but (of course) without a reason why it fails so we play dumb and just do what they ask for:
+    # but it shown no comprehensible reason why it fails so we play dumb and just do what they ask for:
     if lvm pvcreate $verbose -ff --yes --uuid "$pv_uuid" --norestorefile $current_pv_dev ; then
         # Only for successfully created LVM physical volumes remember their
         # orig_pv_dev current_pv_dev mapping (needed when creating LVM volume groups):
@@ -409,14 +503,6 @@ for vg_name in "${!volume_groups[@]}" ; do
     if ! test "$vg_current_pv_devs" ; then
         LogPrintError "Cannot create LVM VG $vg_name (found no current PVs for it)"
         continue
-    fi
-    # Because under certain circumstances it had happened that 'vgcreate' failed
-    # and reported that the VG that is to be creted already exists.
-    # So to be more on the safe side we run 'vgremove' before:
-    if lvm vgremove $verbose -ff --yes $vg_name ; then
-        Log "Unexpectedly 'vgremove' did not fail here because normally $vg_name should not yet exist"
-    else
-        Log "It is normal that 'vgremove' fails because $vg_name should not yet exist (it is only run as precaution)"
     fi
     # Actually create the VG:
     if lvm vgcreate $verbose -ff --yes $vg_name $vg_current_pv_devs ; then
