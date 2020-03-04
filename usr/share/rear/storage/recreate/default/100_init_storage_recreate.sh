@@ -267,7 +267,16 @@ for raid_array_name in $( grep '^ARRAY ' $STORAGE_MDADM_OUTPUT_FILE | cut -d ' '
     # There is no 'mdadm' option to enforce non-interactive mode so we feed 'y' into it to respond positively to all its questions
     # (there is no 'yes' program like /usr/bin/yes in the ReaR recovery system so we feed an unlimited amount of 'y' manually).
     # Without "sleep 1" tens of thousands of '++ true' and '++ echo y' lines would appear in the log in 'set -x' debugscript mode
-    # which also indicates that 'mdadm' is needlessly greedy and swallows unlimited amounts of whatever it gets fed via stdin.
+    # which is caused by the "stdout|stdin" pipe buffer size because on my openSUSE Leap 15.1 system both
+    #   ( set -x ; while true ; do echo 'y' ; done | sleep 1 ) 2>&1 | grep 'echo y' | wc -l
+    # and
+    #   ( set -x ; while true ; do echo 'y' ; done | sleep 10 ) 2>&1 | grep 'echo y' | wc -l
+    # result '32769' (i.e. "echo 'y'" is run 32769 times) where 32769 = 32768 + 1 = 2^15 + 1
+    # which matches what https://en.wikipedia.org/wiki/Pipeline_(Unix) reads
+    #   "In Linux, the size of the buffer is 65,536 bytes (64KiB)"
+    # and each run of "echo 'y'" outputs two bytes 'y' and '\n' and 32769 * 2 = 65538 = 65536 + 2
+    # so that the pipe buffer swallows all the output of the first 32769 - 1 = 32768 runs of "echo 'y'"
+    # but the last run of "echo 'y'" cannot complete because it waits for free space in the pipe buffer.
     # The while loop dies with exit code 141 which means 141 - 128 = 13 = SIGPIPE when 'mdadm' finishes.
     # The exit code of the pipe is the exit code of its last command so we test the 'mdadm' exit code:
     if ! while true ; do echo 'y' ; sleep 1 ; done | mdadm --create $raid_array_name $verbose --level=$raid_level --raid-devices=$raid_devices $mdadm_assume_clean $component_devices ; then
